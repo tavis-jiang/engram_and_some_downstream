@@ -1,0 +1,54 @@
+run:
+  experiment_name: comembed-faaddqr-2v-smoke
+  save_root: ./runs
+
+data:
+  streaming_data_path:
+    - "1"
+    - /tmp/xgram-smollm2-fineweb-cache
+    - ./data/fineweb_10b_streaming
+  streaming_tokenizer_model: /home/bcjiang/.cache/huggingface/hub/models--HuggingFaceTB--SmolLM2-360M/snapshots/f8027fd0eaeea54caa13c31d31b9fdc459c38b49
+  streaming_ckpt_path: ./checkpoints/dataloader.ckpt
+  use_token_column: tokens
+  text_chunk_size: 512
+  prefetch_queue_size: 4
+  pack_method: native:truncate
+
+model:
+  num_layers: 32
+  hidden_size: 960
+  ffn_hidden_size: 2560
+  num_attn_heads: 15
+  num_query_groups: 3
+
+training:
+  seq_len: 512
+  micro_batch_size: 1
+  global_batch_size: 8
+  train_tokens: 4096
+  save_tokens: 4096
+  lr: 0.0003
+  log_interval: 1
+  ac_mode: full
+
+evaluation:
+  downstream:
+    enabled: false
+    eval_interval: 400
+
+embedding_injection:
+  mode: ComEmbed
+  targets: [v]
+  v_layers: [0, 0]
+  shortconv_enabled: true
+  shortconv_kernels: [3, 5, 7]
+  hash_enabled: true
+  hash_token_map_path: ./assets/token_maps/injection_token_map_smollm2_fineweb_alpha0_5_M32_Cap75968_mc3_mwd0_8.npz
+  comembed_variant: fa_add_qr
+  comembed_codebook_size: 4096
+  comembed_residual_dim: 64
+  comembed_hidden_residual_dim: 128
+  comembed_row_permutation: reverse
+  lambda_init: 1.0
+  lambda_warmup_enabled: true
+  lambda_warmup_steps: 100

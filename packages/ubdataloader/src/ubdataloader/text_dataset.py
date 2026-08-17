@@ -150,8 +150,8 @@ class TextDataset:
                 item = TextTokenItem(
                     text=text,
                     token=token,
-                    ck_tot=int(data["ck_tot"]),
-                    ck_idx=int(data["ck_idx"]),
+                    ck_tot=int(data.get("ck_tot", 1)),
+                    ck_idx=int(data.get("ck_idx", 0)),
                 )
 
                 all_items.append(item)

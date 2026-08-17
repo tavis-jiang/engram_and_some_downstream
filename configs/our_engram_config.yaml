@@ -1,0 +1,66 @@
+run:
+  experiment_name: engram-smollm2-360m-fineweb10b
+  save_root: ./runs
+
+data:
+  streaming_data_path:
+    - "1"
+    - /tmp/engram-smollm2-fineweb-cache
+    - ./data/fineweb_10b_streaming
+  streaming_tokenizer_model: /home/bcjiang/.cache/huggingface/hub/models--HuggingFaceTB--SmolLM2-360M/snapshots/f8027fd0eaeea54caa13c31d31b9fdc459c38b49
+  streaming_ckpt_path: ./checkpoints/dataloader.ckpt
+  use_token_column: tokens
+  text_chunk_size: 4096
+  prefetch_queue_size: 16
+  pack_method: native:truncate
+
+model:
+  # SmolLM2-360M architecture, from scratch — 与 baseline / X-gram 保持完全一致。
+  # 注意: 不要在这里设置 freeze_params。Engram 需要和 baseline / X-gram 一样
+  # from scratch 训练 backbone, 否则随机初始化的主干 + 冻结会让 CE loss 卡在 7+。
+  num_layers: 32
+  hidden_size: 960
+  ffn_hidden_size: 2560
+  num_attn_heads: 15
+  num_query_groups: 3
+  dtype: bfloat16
+  attention:
+    use_flash: true
+    dtype: bfloat16
+
+training:
+  # 与 baseline / X-gram 在 *研究层面* 对齐: 同 global_batch_size、同 train_tokens、同 lr。
+  # micro_batch_size 和 ac_mode 是显存逼出来的实现细节, 不属于研究设定:
+  # 9.9B 参数下 mb=1 + ac_mode=full 才能在 8x ADA6000 上跑得起来,
+  # mb=4 会在 step 1 之前就 OOM。
+  micro_batch_size: 1
+  global_batch_size: 512
+  train_tokens: 10000000000
+  lr: 0.0003
+  ac_mode: full
+
+evaluation:
+  downstream:
+    enabled: false
+    eval_interval: 400
+
+embedding_injection:
+  mode: Engram
+  # 全 32 层 H 路径注入, 与 Engram 论文设定一致。
+  # 之前因为 freeze + 缩参数试图回避 OOM, 导致 backbone 不更新, 不再使用。
+  h_layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
+  engram_tokenizer_id: /home/bcjiang/.cache/huggingface/hub/models--HuggingFaceTB--SmolLM2-360M/snapshots/f8027fd0eaeea54caa13c31d31b9fdc459c38b49
+  engram_mode: "2gram+3gram"
+  engram_dim_per_ngram: 960
+  engram_ngram_heads: 2
+  engram_ngram_target_buckets: 303872
+  engram_shortconv_kernel: 4
+  lambda_init: 1.0e-2
+  lambda_warmup_enabled: true
+  lambda_warmup_steps: 120
+
+train_module:
+  dp_config:
+    name: fsdp
+    param_dtype: bfloat16
+    reduce_dtype: bfloat16

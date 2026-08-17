@@ -705,7 +705,19 @@ class TransformerTrainModule(TrainModule):
             )
 
     def optim_step(self):
+        sanitized_nonfinite_grads = 0
+        with torch.no_grad():
+            for p in self.model.parameters():
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                if torch.isfinite(grad).all():
+                    continue
+                sanitized_nonfinite_grads += 1
+                grad.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+
         # Maybe clip gradients.
+        grad_norm: Optional[torch.Tensor] = None
         if self.max_grad_norm is not None:
             grad_norm = self._clip_grad_norm(self.max_grad_norm)
             # NOTE: grad norm is already reduced over ranks, so we set `reduce_type` to `None`.
@@ -716,6 +728,29 @@ class TransformerTrainModule(TrainModule):
                 self.optim.latest_grad_norm = grad_norm
 
         self._log_gradient_metrics()
+
+        if sanitized_nonfinite_grads:
+            log.warning(
+                "Sanitized non-finite gradients on %d parameter tensors before optimizer step",
+                sanitized_nonfinite_grads,
+            )
+
+        if grad_norm is None:
+            grads = [p.grad for p in self.model.parameters() if p.grad is not None]
+            if grads:
+                finite_flags = [torch.isfinite(g).all() for g in grads]
+                all_finite = finite_flags[0]
+                for flag in finite_flags[1:]:
+                    all_finite = torch.logical_and(all_finite, flag)
+                if not bool(all_finite.item()):
+                    log.warning("Skipping optimizer step due to non-finite gradients")
+                    self.zero_grads()
+                    return
+
+        if grad_norm is not None and not torch.isfinite(grad_norm).all():
+            log.warning("Skipping optimizer step due to non-finite total grad norm")
+            self.zero_grads()
+            return
 
         # Maybe adjust learning rate.
         if self.scheduler is not None:

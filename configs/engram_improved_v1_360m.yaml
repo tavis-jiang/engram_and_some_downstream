@@ -1,0 +1,63 @@
+run:
+  experiment_name: engram-improved-v1-smollm2-360m-fineweb10b
+  save_root: ./runs
+
+data:
+  streaming_data_path:
+    - "1"
+    - /tmp/engram-improved-v1-smollm2-fineweb-cache
+    - ./data/fineweb_10b_streaming
+  streaming_tokenizer_model: /home/bcjiang/.cache/huggingface/hub/models--HuggingFaceTB--SmolLM2-360M/snapshots/f8027fd0eaeea54caa13c31d31b9fdc459c38b49
+  streaming_ckpt_path: ./checkpoints/dataloader.ckpt
+  use_token_column: tokens
+  text_chunk_size: 4096
+  prefetch_queue_size: 16
+  pack_method: native:truncate
+
+model:
+  # SmolLM2-360M architecture, aligned with baseline / X-gram faircompare.
+  num_layers: 32
+  hidden_size: 960
+  ffn_hidden_size: 2560
+  num_attn_heads: 15
+  num_query_groups: 3
+  dtype: bfloat16
+  attention:
+    use_flash: true
+    dtype: bfloat16
+
+training:
+  # Try micro_batch_size=2; fall back to 1 if OOM.
+  micro_batch_size: 2
+  global_batch_size: 512
+  train_tokens: 10000000000
+  lr: 0.0003
+  ac_mode: full
+
+evaluation:
+  downstream:
+    enabled: false
+    eval_interval: 400
+
+embedding_injection:
+  mode: Engram
+  # Concentrate capacity in early-to-mid layers instead of all 32 layers.
+  h_layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+  engram_tokenizer_id: /home/bcjiang/.cache/huggingface/hub/models--HuggingFaceTB--SmolLM2-360M/snapshots/f8027fd0eaeea54caa13c31d31b9fdc459c38b49
+  # Single 2-gram level with larger dim/bucket (best CE trend in reruns).
+  engram_mode: "2gram"
+  engram_dim_per_ngram: 512
+  engram_ngram_heads: 4
+  engram_ngram_target_buckets: 49152
+  # Disable shortconv for this baseline; re-enable after adding multi-scale [3,5,7].
+  engram_shortconv_enabled: false
+  engram_shortconv_kernel: 4
+  lambda_init: 1.0e-2
+  lambda_warmup_enabled: true
+  lambda_warmup_steps: 120
+
+train_module:
+  dp_config:
+    name: fsdp
+    param_dtype: bfloat16
+    reduce_dtype: float32

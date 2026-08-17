@@ -1,0 +1,27 @@
+{
+  "model": "baseline",
+  "task": "triviaqa_em",
+  "run_label": "full_sharded_20260605",
+  "num_examples": 7993,
+  "correct": 2,
+  "exact_match": 0.00025021894157387716,
+  "records": "reports/generation_em_baseline_triviaqa_em_full_sharded_20260605_20260605-154835.jsonl",
+  "source_files": [
+    "reports/generation_em_baseline_triviaqa_em_shard0-of-16_20260605-135653.jsonl",
+    "reports/generation_em_baseline_triviaqa_em_shard1-of-16_20260605-135714.jsonl",
+    "reports/generation_em_baseline_triviaqa_em_shard10-of-16_20260605-142413.jsonl",
+    "reports/generation_em_baseline_triviaqa_em_shard11-of-16_20260605-142401.jsonl",
+    "reports/generation_em_baseline_triviaqa_em_shard12-of-16_20260605-143641.jsonl",
+    "reports/generation_em_baseline_triviaqa_em_shard13-of-16_20260605-143640.jsonl",
+    "reports/generation_em_baseline_triviaqa_em_shard14-of-16_20260605-143720.jsonl",
+    "reports/generation_em_baseline_triviaqa_em_shard15-of-16_20260605-143723.jsonl",
+    "reports/generation_em_baseline_triviaqa_em_shard2-of-16_20260605-135654.jsonl",
+    "reports/generation_em_baseline_triviaqa_em_shard3-of-16_20260605-135709.jsonl",
+    "reports/generation_em_baseline_triviaqa_em_shard4-of-16_20260605-141008.jsonl",
+    "reports/generation_em_baseline_triviaqa_em_shard5-of-16_20260605-141007.jsonl",
+    "reports/generation_em_baseline_triviaqa_em_shard6-of-16_20260605-141113.jsonl",
+    "reports/generation_em_baseline_triviaqa_em_shard7-of-16_20260605-141042.jsonl",
+    "reports/generation_em_baseline_triviaqa_em_shard8-of-16_20260605-142247.jsonl",
+    "reports/generation_em_baseline_triviaqa_em_shard9-of-16_20260605-142329.jsonl"
+  ]
+}

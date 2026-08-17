@@ -98,9 +98,22 @@ RUN_DIR="$TMP_PARENT/run-${RUN_ID}"
 mkdir -p "$RUN_DIR"
 RUN_CKPT="$RUN_DIR/dataloader.ckpt"
 
+copy_ckpt_file() {
+  local src_file=$1
+  local dst_file=$2
+  cp -p "$src_file" "$dst_file" 2>/dev/null || cp "$src_file" "$dst_file"
+}
+
 if [[ -n "${CKPT_SRC}" ]] && [[ -f "$CKPT_SRC" ]]; then
   echo "[info] Copying ckpt from: $CKPT_SRC -> $RUN_CKPT"
-  cp -p "$CKPT_SRC" "$RUN_CKPT" 2>/dev/null || cp "$CKPT_SRC" "$RUN_CKPT"
+  copy_ckpt_file "$CKPT_SRC" "$RUN_CKPT"
+  for ckpt_sidecar in "$CKPT_SRC".*; do
+    [[ -e "$ckpt_sidecar" ]] || continue
+    [[ "$ckpt_sidecar" == *.lock ]] && continue
+    sidecar_suffix="${ckpt_sidecar#"$CKPT_SRC"}"
+    echo "[info] Copying ckpt sidecar: $ckpt_sidecar -> ${RUN_CKPT}${sidecar_suffix}"
+    copy_ckpt_file "$ckpt_sidecar" "${RUN_CKPT}${sidecar_suffix}"
+  done
 elif [[ -n "${CKPT_SRC}" ]]; then
   echo "[warn] Source ckpt not found: $CKPT_SRC ; DuckDB will create a new database on first use"
 else
@@ -126,6 +139,12 @@ if [ -n "${RUN_NAME:-}" ]; then
 fi
 if [ -n "${SAVE_ROOT:-}" ]; then
   EXTRA_ARGS+=(--save-root "${SAVE_ROOT}")
+fi
+if [ -n "${LOAD_PATH:-}" ]; then
+  EXTRA_ARGS+=(--load-path "${LOAD_PATH}")
+fi
+if [ -n "${LOAD_STRATEGY:-}" ]; then
+  EXTRA_ARGS+=(--load-strategy "${LOAD_STRATEGY}")
 fi
 if [ -n "${MICRO_BATCH_SIZE:-}" ]; then
   EXTRA_ARGS+=(--micro-batch-size "${MICRO_BATCH_SIZE}")
@@ -155,6 +174,8 @@ set -x
 echo "[info] Run name: ${RUN_NAME:-<from-yaml>}"
 echo "[info] Master port: ${MASTER_PORT}"
 echo "[info] YAML config: ${YAML_CONFIG}"
+echo "[info] Load path: ${LOAD_PATH:-<none>}"
+echo "[info] Load strategy: ${LOAD_STRATEGY:-never}"
 if [ -n "${STREAMING_DATA_PATH:-}" ]; then
   echo "[info] Streaming data path source: env STREAMING_DATA_PATH"
 else

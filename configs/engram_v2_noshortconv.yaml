@@ -1,0 +1,66 @@
+run:
+  experiment_name: engram-v2-noshortconv-smollm2-360m-fineweb10b
+  save_root: ./runs
+
+data:
+  streaming_data_path:
+    - "1"
+    - /tmp/engram-v2-smollm2-fineweb-cache
+    - ./data/fineweb_10b_streaming
+  streaming_tokenizer_model: /home/bcjiang/.cache/huggingface/hub/models--HuggingFaceTB--SmolLM2-360M/snapshots/f8027fd0eaeea54caa13c31d31b9fdc459c38b49
+  streaming_ckpt_path: ./checkpoints/dataloader.ckpt
+  use_token_column: tokens
+  text_chunk_size: 4096
+  prefetch_queue_size: 16
+  pack_method: native:truncate
+
+model:
+  num_layers: 32
+  hidden_size: 960
+  ffn_hidden_size: 2560
+  num_attn_heads: 15
+  num_query_groups: 3
+  dtype: bfloat16
+  attention:
+    use_flash: true
+    dtype: bfloat16
+
+training:
+  micro_batch_size: 4
+  global_batch_size: 512
+  train_tokens: 10000000000
+  save_tokens: 500000000
+  lr: 0.0003
+  ac_mode: full
+
+evaluation:
+  downstream:
+    enabled: false
+    eval_interval: 400
+
+embedding_injection:
+  mode: Engram
+  # Use X-gram proven v-path injection pattern.
+  targets: [v]
+  v_layers: [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9]
+  engram_tokenizer_id: /home/bcjiang/.cache/huggingface/hub/models--HuggingFaceTB--SmolLM2-360M/snapshots/f8027fd0eaeea54caa13c31d31b9fdc459c38b49
+  # Engram mechanism: single 2-gram level with large dim to match X-gram capacity.
+  engram_mode: "2gram"
+  engram_dim_per_ngram: 1152
+  engram_ngram_heads: 4
+  engram_ngram_target_buckets: 49152
+  # Disable tokenizer compression to avoid information loss.
+  engram_use_compressed_lookup: false
+  # Multi-scale ShortConv, matching X-gram.
+  engram_shortconv_enabled: false
+  engram_shortconv_kernels: [3, 5, 7]
+  # X-gram style gate warmup: start small and gradually turn on.
+  lambda_init: 1.0
+  lambda_warmup_enabled: true
+  lambda_warmup_steps: 120
+
+train_module:
+  dp_config:
+    name: fsdp
+    param_dtype: bfloat16
+    reduce_dtype: float32

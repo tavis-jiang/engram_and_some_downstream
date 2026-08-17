@@ -1,0 +1,9 @@
+{
+  "model": "baseline",
+  "task": "gsm8k_em",
+  "run_label": "shard2-of-8",
+  "num_examples": 165,
+  "correct": 4,
+  "exact_match": 0.024242424242424242,
+  "records": "reports/generation_em_baseline_gsm8k_em_shard2-of-8_20260605-141614.jsonl"
+}

@@ -6,9 +6,11 @@ used by the current open-source X-gram / Engram / Retoken / Mort implementation.
 """
 
 from .engram import (
+    EngramInjectionEmbedding,
     EngramModule,
     apply_engram_pre_block,
     build_engram_modules,
+    build_engram_v_modules,
 )
 from .metrics import _warmup_scale_to_python_float
 from .mort import (
@@ -26,6 +28,7 @@ from .runtime import InjectionBlockContext, InjectionBlockResult
 from .xgram import build_xgram_modules, prepare_xgram_block_kwargs
 
 __all__ = [
+    "EngramInjectionEmbedding",
     "EngramModule",
     "InjectionBlockContext",
     "InjectionBlockResult",
@@ -33,6 +36,7 @@ __all__ = [
     "apply_engram_pre_block",
     "apply_mort_sparse_injection",
     "build_engram_modules",
+    "build_engram_v_modules",
     "build_mort_modules",
     "build_retoken_modules",
     "build_xgram_modules",

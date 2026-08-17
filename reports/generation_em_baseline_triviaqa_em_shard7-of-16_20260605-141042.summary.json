@@ -1,0 +1,9 @@
+{
+  "model": "baseline",
+  "task": "triviaqa_em",
+  "run_label": "shard7-of-16",
+  "num_examples": 500,
+  "correct": 2,
+  "exact_match": 0.004,
+  "records": "reports/generation_em_baseline_triviaqa_em_shard7-of-16_20260605-141042.jsonl"
+}

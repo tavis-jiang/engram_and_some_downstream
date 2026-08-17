@@ -110,12 +110,23 @@ def create_tokens_buffer(
     tokenizer: AutoTokenizer,
     pack_method: str,
 ) -> Tuple[List[int], List[int]]:
+    if "truncate" in pack_method:
+        token_list = [
+            token[:each_sample_seq_len] if len(token) > each_sample_seq_len else token
+            for token in token_list
+        ]
+
     if "native" in pack_method:
         return native_pack_tokens(token_list, each_sample_seq_len, tokenizer)
     elif "bestfit" in pack_method:
         return bestfit_pack_tokens(token_list, each_sample_seq_len, tokenizer)
     else:
         raise NotImplementedError(f"Invalid pack method: {pack_method}")
+
+
+def ensure_pad_token(tokenizer: AutoTokenizer) -> None:
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
 
 def scatter_item(
@@ -220,6 +231,7 @@ def text_token_worker(
         trust_remote_code=True,
         add_eos_token=True,
     )
+    ensure_pad_token(tokenizer)
 
     # only master node will read the text data
     if is_master_node:

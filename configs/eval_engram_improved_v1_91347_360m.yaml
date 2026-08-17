@@ -1,0 +1,59 @@
+run:
+  experiment_name: eval-engram-improved-v1-91347-smollm2-360m-fineweb10b
+  save_root: ./runs_eval
+
+data:
+  streaming_data_path:
+    - "1"
+    - /tmp/engram-improved-v1-91347-eval-cache
+    - ./data/fineweb_10b_streaming
+  streaming_tokenizer_model: /home/bcjiang/.cache/huggingface/hub/models--HuggingFaceTB--SmolLM2-360M/snapshots/f8027fd0eaeea54caa13c31d31b9fdc459c38b49
+  streaming_ckpt_path: ./checkpoints/dataloader.ckpt
+  use_token_column: tokens
+  text_chunk_size: 4096
+  prefetch_queue_size: 16
+  pack_method: native:truncate
+
+model:
+  num_layers: 32
+  hidden_size: 960
+  ffn_hidden_size: 2560
+  num_attn_heads: 15
+  num_query_groups: 3
+
+training:
+  seq_len: 8192
+  micro_batch_size: 2
+  global_batch_size: 512
+  train_tokens: 10000000000
+  warmup_fraction: 0.05
+  lr: 0.0003
+  min_lr: 0.00003
+  ac_mode: full
+  log_interval: 10
+
+evaluation:
+  downstream:
+    enabled: false
+    eval_interval: 400
+
+embedding_injection:
+  mode: Engram
+  targets: [h]
+  h_layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+  engram_tokenizer_id: /home/bcjiang/.cache/huggingface/hub/models--HuggingFaceTB--SmolLM2-360M/snapshots/f8027fd0eaeea54caa13c31d31b9fdc459c38b49
+  engram_mode: "2gram"
+  engram_dim_per_ngram: 512
+  engram_ngram_heads: 4
+  engram_ngram_target_buckets: 49152
+  engram_base_seed: 42
+  engram_hc_mult: 1
+  engram_shortconv_enabled: false
+  engram_shortconv_kernel: 4
+  engram_shortconv_dilation: 1
+  engram_shortconv_activation: true
+  lambda_init: 1.0
+  lambda_warmup_enabled: false
+  lambda_warmup_steps: 0
+  depth_scale_disabled: false
+  engram_legacy_h_path: true

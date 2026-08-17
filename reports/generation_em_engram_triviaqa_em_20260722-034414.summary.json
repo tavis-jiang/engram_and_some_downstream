@@ -1,0 +1,9 @@
+{
+  "model": "engram",
+  "task": "triviaqa_em",
+  "run_label": null,
+  "num_examples": 7993,
+  "correct": 30,
+  "exact_match": 0.003753284123608157,
+  "records": "reports/generation_em_engram_triviaqa_em_20260722-034414.jsonl"
+}

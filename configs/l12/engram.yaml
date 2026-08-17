@@ -41,3 +41,6 @@ embedding_injection:
   engram_ngram_heads: 2
   engram_ngram_target_buckets: 303872
   engram_shortconv_kernel: 4
+  lambda_init: 1.0e-2
+  lambda_warmup_enabled: true
+  lambda_warmup_steps: 247

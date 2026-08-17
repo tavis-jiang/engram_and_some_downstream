@@ -1,0 +1,9 @@
+{
+  "model": "xgram",
+  "task": "gsm8k_em",
+  "run_label": "shard5-of-8",
+  "num_examples": 165,
+  "correct": 3,
+  "exact_match": 0.01818181818181818,
+  "records": "reports/generation_em_xgram_gsm8k_em_shard5-of-8_20260606-124448.jsonl"
+}

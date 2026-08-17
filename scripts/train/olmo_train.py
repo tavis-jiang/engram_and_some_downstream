@@ -37,7 +37,7 @@ from olmo_core.nn.transformer import Transformer
 from olmo_core.nn.transformer.config import TransformerConfig, TransformerEmbeddingInjectionConfig
 from olmo_core.nn.lm_head import LMOutputWithLoss
 from olmo_core.nn.feed_forward import FeedForwardConfig
-from olmo_core.optim import CosWithWarmup, OptimGroupOverride, SkipStepAdamWConfig
+from olmo_core.optim import AdamWConfig, CosWithWarmup, OptimGroupOverride, SkipStepAdamWConfig
 from olmo_core.train import (
     Duration,
     LoadStrategy,
@@ -95,11 +95,11 @@ _DEFAULT_DOWNSTREAM_EVAL_TASKS = [
 
 def _canonicalize_injection_mode(raw_mode: Optional[str]) -> str:
     mode = (raw_mode or "None").strip()
-    if mode in {"None", "X-gram", "Engram", "Retoken", "Mort"}:
+    if mode in {"None", "X-gram", "ComEmbed", "Engram", "Retoken", "Mort"}:
         return mode
 
     raise ValueError(
-        f"Unsupported INJECTION_VERSION='{mode}'. Valid values: None, X-gram, Engram, Retoken, Mort."
+        f"Unsupported INJECTION_VERSION='{mode}'. Valid values: None, X-gram, ComEmbed, Engram, Retoken, Mort."
     )
 
 
@@ -151,6 +151,14 @@ def _coerce_positive_int(value: Any, *, field_name: str) -> int:
     if int_value <= 0:
         raise ValueError(f"{field_name} must be > 0, got {int_value}")
     return int_value
+
+
+def _coerce_optional_positive_int(value: Any, *, field_name: str) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() in {"", "none", "null", "off", "disabled"}:
+        return None
+    return _coerce_positive_int(value, field_name=field_name)
 
 
 def _parse_layer_list_env(env_name: str) -> Optional[List[int]]:
@@ -216,7 +224,7 @@ def _resolve_injection_target_state(
     *,
     injection_targets_raw: Optional[str],
 ) -> Tuple[List[str], List[str], bool]:
-    if injection_version == "X-gram":
+    if injection_version in {"X-gram", "ComEmbed"}:
         targets = _parse_ordered_injection_targets(
             injection_targets_raw,
             valid=_XGRAM_TARGET_SET,
@@ -230,7 +238,7 @@ def _resolve_injection_target_state(
 def _resolve_injection_target_state_from_config(
     injection_config: TransformerEmbeddingInjectionConfig,
 ) -> Tuple[List[str], List[str], bool]:
-    if (injection_config.mode or "None") != "X-gram":
+    if (injection_config.mode or "None") not in {"X-gram", "ComEmbed"}:
         return [], [], False
     targets = list(injection_config.targets or ["h"])
     return targets, [target for target in targets if target in _QKVO_TARGET_SET], "h" in targets
@@ -281,7 +289,7 @@ def _build_embedding_injection_config_from_env(
         injection_targets_raw=os.environ.get("INJECTION_TARGETS"),
     )
 
-    lambda_warmup_enabled = injection_version == "X-gram" and _parse_bool_env(
+    lambda_warmup_enabled = injection_version in {"X-gram", "ComEmbed", "Engram"} and _parse_bool_env(
         "INJECTION_LAMBDA_WARMUP_ENABLE", "1"
     )
     lambda_warmup_steps = _parse_optional_int_env("INJECTION_LAMBDA_WARMUP_STEPS")
@@ -299,7 +307,7 @@ def _build_embedding_injection_config_from_env(
     lambda_warmup_scale = _parse_optional_float_env("INJECTION_LAMBDA_WARMUP_SCALE")
     if lambda_warmup_scale is not None and lambda_warmup_scale > 0:
         lambda_warmup_steps = max(0, int(math.ceil(lambda_warmup_steps * lambda_warmup_scale)))
-    if injection_version == "X-gram" and lambda_warmup_enabled and lambda_warmup_steps == 0:
+    if injection_version in {"X-gram", "ComEmbed", "Engram"} and lambda_warmup_enabled and lambda_warmup_steps == 0:
         raise ValueError(
             "INJECTION_LAMBDA_WARMUP_ENABLE=1 but no valid warmup steps inferred; "
             "please set INJECTION_LAMBDA_WARMUP_STEPS or WARMUP_TOKENS."
@@ -475,7 +483,7 @@ def _build_embedding_injection_config_from_yaml(
     normalized["targets"] = _parse_targets_value(normalized.get("targets"))
     _apply_embedding_injection_yaml_env_overrides(normalized)
 
-    if mode == "X-gram" and normalized["targets"] is None:
+    if mode in {"X-gram", "ComEmbed"} and normalized["targets"] is None:
         normalized["targets"] = _infer_xgram_targets_from_yaml(normalized)
 
     if "layers" not in normalized or normalized.get("layers") in (None, []):
@@ -492,12 +500,12 @@ def _build_embedding_injection_config_from_yaml(
     if "lambda_warmup_enabled" in normalized:
         lambda_warmup_enabled = bool(normalized.get("lambda_warmup_enabled"))
     else:
-        lambda_warmup_enabled = mode == "X-gram"
+        lambda_warmup_enabled = mode in {"X-gram", "ComEmbed", "Engram"}
     normalized["lambda_warmup_enabled"] = lambda_warmup_enabled
     lambda_warmup_steps = normalized.get("lambda_warmup_steps")
     if lambda_warmup_steps is None or int(lambda_warmup_steps) <= 0:
         if (
-            mode == "X-gram"
+            mode in {"X-gram", "ComEmbed", "Engram"}
             and lambda_warmup_enabled
             and warmup_tokens is not None
             and warmup_tokens > 0
@@ -968,6 +976,8 @@ def build_config(
     streaming_tokenizer_model: str,
     streaming_ckpt_path: str,
     save_root: str,
+    load_path: Optional[str],
+    load_strategy: LoadStrategy,
     seq_len: int,
     micro_batch_size: int,
     global_batch_size_samples: int,
@@ -988,6 +998,7 @@ def build_config(
     qk_norm: bool,
     rope_theta: int,
     layer_norm_eps: float,
+    freeze_params: Optional[List[str]],
     dp_type: str,
     param_dtype: DType,
     reduce_dtype: DType,
@@ -1033,9 +1044,15 @@ def build_config(
 
     if init_std is None:
         init_std = float(os.environ.get("INIT_STD", "0.02"))
-        print(f"Using INIT_STD: {init_std} (from environment: {os.environ.get('INIT_STD', 'not set, using default')})")
+        print(
+            f"Using INIT_STD: {init_std} (from environment: {os.environ.get('INIT_STD', 'not set, using default')})",
+            file=sys.stderr,
+        )
     else:
-        print(f"Using INIT_STD: {init_std:.3f} (derived from hidden_size={hidden_size})")
+        print(
+            f"Using INIT_STD: {init_std:.3f} (derived from hidden_size={hidden_size})",
+            file=sys.stderr,
+        )
     
     injection_config = embedding_injection
 
@@ -1055,6 +1072,8 @@ def build_config(
         use_flash=False,
         embedding_injection=injection_config,
     )
+    if freeze_params:
+        model_config.freeze_params = list(freeze_params)
 
     warmup_frac = (warmup_tokens / float(train_tokens)) if (warmup_tokens is not None and train_tokens > 0) else warmup_fraction
     min_lr_effective = min_lr
@@ -1064,7 +1083,10 @@ def build_config(
         alpha_f=min_lr_effective / lr,
     )
 
-    compile_flag = True
+    compile_flag = _coerce_bool(
+        os.environ.get("OLMO_COMPILE", "1"),
+        field_name="OLMO_COMPILE",
+    )
 
     group_overrides: List[OptimGroupOverride] = []
     if injection_config is not None:
@@ -1098,11 +1120,47 @@ def build_config(
             pass
         elif injection_version_env == "Mort":
             pass
+        elif injection_version_env == "ComEmbed":
+            vocab_size = tokenizer_config.padded_vocab_size()
+            d_model = hidden_size
+            comembed_variant = str(getattr(injection_config, "comembed_variant", None) or "fa_qr")
+            override_lr = float(os.environ.get("OLMO_COMEMBED_LR", str(lr)))
+            override_weight_decay = float(os.environ.get("OLMO_COMEMBED_WEIGHT_DECAY", "0.0"))
+            print(
+                f"ComEmbed override LR ({comembed_variant}): {override_lr}, weight_decay: {override_weight_decay}",
+                file=sys.stderr,
+            )
+            override_params = []
+            if h_active:
+                override_params.append("_injection_h_embeddings.*.*")
+                override_params.append("_injection_h_gates.*.*")
+            if qk_shared_active:
+                override_params.append("_injection_qk_embeddings.*.*")
+                override_params.append("_injection_qk_gates.*.*")
+            else:
+                if q_active:
+                    override_params.append("_injection_q_embeddings.*.*")
+                    override_params.append("_injection_q_gates.*.*")
+                if k_active:
+                    override_params.append("_injection_k_embeddings.*.*")
+                    override_params.append("_injection_k_gates.*.*")
+            if v_active:
+                override_params.append("_injection_v_embeddings.*.*")
+                override_params.append("_injection_v_gates.*.*")
+            if o_active:
+                override_params.append("_injection_o_embeddings.*.*")
+                override_params.append("_injection_o_gates.*.*")
+            group_overrides.append(
+                OptimGroupOverride(
+                    params=override_params,
+                    opts=dict(lr=override_lr, weight_decay=override_weight_decay),
+                )
+            )
         elif injection_version_env == "X-gram" and hash_enabled:
             vocab_size = tokenizer_config.padded_vocab_size()
             d_model = hidden_size
             override_lr = lr * math.sqrt(vocab_size / d_model)
-            print(f"Override LR: {override_lr}")
+            print(f"Override LR: {override_lr}", file=sys.stderr)
             override_params = []
             if h_active:
                 override_params.append("_injection_h_embeddings.*._bucket_embedding.weight")
@@ -1124,11 +1182,38 @@ def build_config(
                 )
             )
 
+        elif injection_version_env == "Engram":
+            _engram_mode_parts = {
+                s.strip() for s in (injection_config.engram_mode or "1gram").split("+")
+            }
+            _engram_targets = list(injection_config.targets or ["h"])
+            vocab_size = tokenizer_config.padded_vocab_size()
+            d_model = hidden_size
+            override_lr = lr * math.sqrt(vocab_size / d_model)
+            print(f"Override LR: {override_lr}", file=sys.stderr)
+            override_params = []
+            if "1gram" in _engram_mode_parts:
+                if "h" in _engram_targets:
+                    override_params.append("_injection_h_embeddings.*.embedding.weight")
+                if "v" in _engram_targets:
+                    override_params.append("_injection_v_embeddings.*.embedding.weight")
+            if any(p != "1gram" for p in _engram_mode_parts):
+                if "h" in _engram_targets:
+                    override_params.append("_injection_h_embeddings.*.ngram_embeddings.*.weight")
+                if "v" in _engram_targets:
+                    override_params.append("_injection_v_embeddings.*.ngram_embeddings.*.weight")
+            group_overrides.append(
+                OptimGroupOverride(
+                    params=override_params,
+                    opts=dict(lr=override_lr),
+                )
+            )
+
         else:
             vocab_size = tokenizer_config.padded_vocab_size()
             d_model = hidden_size
             override_lr = lr * math.sqrt(vocab_size / d_model)
-            print(f"Override LR: {override_lr}")
+            print(f"Override LR: {override_lr}", file=sys.stderr)
 
             override_params = []
             if h_active:
@@ -1144,15 +1229,6 @@ def build_config(
                 override_params.append("_injection_v_embeddings.*.weight")
             if o_active:
                 override_params.append("_injection_o_embeddings.*.weight")
-            elif injection_version_env == "Engram":
-                _engram_mode_parts = {
-                    s.strip() for s in (injection_config.engram_mode or "1gram").split("+")
-                }
-                override_params = []
-                if "1gram" in _engram_mode_parts:
-                    override_params.append("_injection_h_embeddings.*.embedding.weight")
-                if any(p != "1gram" for p in _engram_mode_parts):
-                    override_params.append("_injection_h_embeddings.*.ngram_embeddings.*.weight")
 
             group_overrides.append(
                 OptimGroupOverride(
@@ -1162,22 +1238,39 @@ def build_config(
             )
 
     if group_overrides:
-        print("Configured optimizer group overrides:")
+        print("Configured optimizer group overrides:", file=sys.stderr)
         for idx, override in enumerate(group_overrides, start=1):
-            print(f"  [{idx}] params={override.params} opts={override.opts}")
+            print(f"  [{idx}] params={override.params} opts={override.opts}", file=sys.stderr)
     else:
-        print("No optimizer group overrides configured.")
+        print("No optimizer group overrides configured.", file=sys.stderr)
 
-    train_module_config = TransformerTrainModuleConfig(
-        rank_microbatch_size=rank_microbatch_size_tokens,
-        max_sequence_length=seq_len,
-        optim=SkipStepAdamWConfig(
+    use_plain_adamw = _coerce_bool(
+        os.environ.get("OLMO_USE_PLAIN_ADAMW", "0"),
+        field_name="OLMO_USE_PLAIN_ADAMW",
+    )
+    optim_config = (
+        AdamWConfig(
+            lr=lr,
+            weight_decay=weight_decay,
+            betas=(beta1, beta2),
+            compile=compile_flag,
+            foreach=False,
+            group_overrides=group_overrides if group_overrides else None,
+        )
+        if use_plain_adamw
+        else SkipStepAdamWConfig(
             lr=lr,
             weight_decay=weight_decay,
             betas=(beta1, beta2),
             compile=compile_flag,
             group_overrides=group_overrides if group_overrides else None,
-        ),
+        )
+    )
+
+    train_module_config = TransformerTrainModuleConfig(
+        rank_microbatch_size=rank_microbatch_size_tokens,
+        max_sequence_length=seq_len,
+        optim=optim_config,
         scheduler=scheduler,
         compile_model=compile_flag,
         dp_config=TransformerDataParallelConfig(
@@ -1204,14 +1297,39 @@ def build_config(
     )
 
     save_interval_steps = max(1, save_tokens // global_batch_size_tokens)
-    ephemeral_save_interval_candidate = max(1, save_interval_steps // 10)
-    ephemeral_save_interval = min(ephemeral_save_interval_candidate, save_interval_steps - 1) if save_interval_steps > 1 else None
+    ephemeral_save_interval_env = os.environ.get("OLMO_EPHEMERAL_SAVE_INTERVAL")
+    if ephemeral_save_interval_env is None:
+        ephemeral_save_interval_candidate = max(1, save_interval_steps // 10)
+        ephemeral_save_interval = (
+            min(ephemeral_save_interval_candidate, save_interval_steps - 1)
+            if save_interval_steps > 1
+            else None
+        )
+    else:
+        ephemeral_save_interval = _coerce_optional_positive_int(
+            ephemeral_save_interval_env,
+            field_name="OLMO_EPHEMERAL_SAVE_INTERVAL",
+        )
+        if ephemeral_save_interval is not None and ephemeral_save_interval >= save_interval_steps:
+            raise ValueError(
+                "OLMO_EPHEMERAL_SAVE_INTERVAL must be less than the permanent "
+                f"save interval ({save_interval_steps}), got {ephemeral_save_interval}"
+            )
+
+    pre_train_checkpoint_env = os.environ.get("OLMO_PRE_TRAIN_CHECKPOINT")
+    pre_train_checkpoint = (
+        None
+        if pre_train_checkpoint_env is None
+        else _coerce_bool(pre_train_checkpoint_env, field_name="OLMO_PRE_TRAIN_CHECKPOINT")
+    )
+    save_async = _coerce_bool(os.environ.get("OLMO_SAVE_ASYNC", "1"), field_name="OLMO_SAVE_ASYNC")
 
     trainer_config = (
         TrainerConfig(
             save_folder=f"{save_root}/{run_name}",
+            load_path=load_path,
             save_overwrite=True,
-            load_strategy=LoadStrategy.never,
+            load_strategy=load_strategy,
             metrics_collect_interval=log_interval,
             cancel_check_interval=10,
             max_duration=Duration.tokens(train_tokens),
@@ -1222,7 +1340,8 @@ def build_config(
             CheckpointerCallback(
                 save_interval=save_interval_steps,
                 ephemeral_save_interval=ephemeral_save_interval,
-                save_async=True,
+                pre_train_checkpoint=pre_train_checkpoint,
+                save_async=save_async,
             ),
         )
         .with_callback(
@@ -1278,6 +1397,8 @@ def main(
     streaming_tokenizer_model: Optional[str],
     streaming_ckpt_path: Optional[str],
     save_root: Optional[str],
+    load_path: Optional[str],
+    load_strategy: str,
     micro_batch_size: Optional[int],
     streaming_text_chunk_queue_size: Optional[int],
     streaming_text_chunk_size: Optional[int],
@@ -1290,6 +1411,7 @@ def main(
     print_resolved_config: bool,
     overrides: List[str],
 ):
+    log = logging.getLogger(__name__)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
 
@@ -1335,7 +1457,7 @@ def main(
     LR_DECAY_TOKENS = int(os.environ.get("OLMO_LR_DECAY_TOKENS", TRAIN_TOKENS))
     WARMUP_FRACTION = float(training_yaml.get("warmup_fraction", os.environ.get("OLMO_WARMUP_FRACTION", 0.05)))
     if yaml_path is not None:
-        WARMUP_TOKENS = int(TRAIN_TOKENS * WARMUP_FRACTION)
+        WARMUP_TOKENS = int(LR_DECAY_TOKENS * WARMUP_FRACTION)
     else:
         WARMUP_TOKENS = int(os.environ["WARMUP_TOKENS"]) if os.environ.get("WARMUP_TOKENS") else None
     save_tokens_value = training_yaml.get("save_tokens")
@@ -1372,6 +1494,18 @@ def main(
     QK_NORM = True
     ROPE_THETA = 500_000
     LAYER_NORM_EPS = 1e-8
+    freeze_params_yaml = model_yaml.get("freeze_params")
+    if freeze_params_yaml is None and _coerce_bool(
+        os.environ.get("OLMO_FREEZE_BACKBONE", "0"),
+        field_name="OLMO_FREEZE_BACKBONE",
+    ):
+        FREEZE_PARAMS = ["embeddings.*", "blocks.*", "lm_head.*"]
+    elif freeze_params_yaml is None:
+        FREEZE_PARAMS = None
+    elif isinstance(freeze_params_yaml, list) and all(isinstance(p, str) for p in freeze_params_yaml):
+        FREEZE_PARAMS = list(freeze_params_yaml)
+    else:
+        raise ValueError("model.freeze_params must be a list of string glob patterns")
 
     DP_TYPE = os.environ.get("OLMO_DP_TYPE", "hsdp")
     PARAM_DTYPE = _to_dtype("bfloat16")
@@ -1414,6 +1548,7 @@ def main(
         data_yaml=data_yaml,
         launcher_mode=launcher_mode,
     )
+    load_strategy_value = LoadStrategy(load_strategy)
 
     downstream_enabled_value = downstream_yaml.get("enabled", False)
     DOWNSTREAM_ENABLED = _coerce_bool(
@@ -1462,6 +1597,8 @@ def main(
         streaming_tokenizer_model=resolved.streaming_tokenizer_model,
         streaming_ckpt_path=resolved.streaming_ckpt_path,
         save_root=resolved.save_root,
+        load_path=load_path,
+        load_strategy=load_strategy_value,
         seq_len=SEQ_LEN,
         micro_batch_size=MICRO_BATCH_SIZE,
         global_batch_size_samples=GLOBAL_BATCH_SIZE_SAMPLES,
@@ -1482,6 +1619,7 @@ def main(
         qk_norm=QK_NORM,
         rope_theta=ROPE_THETA,
         layer_norm_eps=LAYER_NORM_EPS,
+        freeze_params=FREEZE_PARAMS,
         dp_type=DP_TYPE,
         param_dtype=PARAM_DTYPE,
         reduce_dtype=REDUCE_DTYPE,
@@ -1504,6 +1642,9 @@ def main(
     ).merge(overrides)
 
     launch_meta = resolved.as_metadata()
+    if load_path is not None:
+        launch_meta["load_path"] = load_path
+    launch_meta["load_strategy"] = str(load_strategy_value)
 
     if print_resolved_config:
         print(
@@ -1521,9 +1662,14 @@ def main(
     _log_resolved_launch_metadata(resolved)
 
     
-    
-    # Log model diagnostics before training starts
-    log_model_diagnostics(cfg)
+    if _coerce_bool(
+        os.environ.get("OLMO_SKIP_MODEL_DIAGNOSTICS", "0"),
+        field_name="OLMO_SKIP_MODEL_DIAGNOSTICS",
+    ):
+        log.info("Skipping CPU model diagnostics because OLMO_SKIP_MODEL_DIAGNOSTICS=1")
+    else:
+        # This builds a CPU-side model for statistics; skip it for extremely large injected models.
+        log_model_diagnostics(cfg)
     
     # Set RNG states on all devices (align with other scripts)
     seed_all(cfg.init_seed)
@@ -1551,8 +1697,12 @@ def main(
                 print(f"  Attention targets: {qkvo_targets}")
                 print(f"  Attention path: target = target + (1/√n) * Σ (gate_j * depth_scale * warmup) * E_j")
         elif injection_version == "Engram":
-            print(f"  Gating: internal gate (EngramOneGramModule)")
-            print(f"  Injection formula: h = h + (1/√n) * Σ engram_j(input_ids, h)")
+            if getattr(injection_cfg, "engram_legacy_h_path", False):
+                print(f"  Gating: legacy H-path Engram internal gate only")
+                print(f"  Injection formula: h = h + engram(input_ids, h)")
+            else:
+                print(f"  Gating: internal Engram gate plus external lambda/depth/warmup scale")
+                print(f"  Injection formula: h = h + (lambda * depth_scale * warmup) * engram(input_ids, h)")
         elif injection_version == "Retoken":
             print(f"  Gating: ReToken modulation vector")
             print(f"  Injection location: before the FFN residual (elementwise scaling)")
@@ -1580,10 +1730,8 @@ def main(
         if name == "tensorboard" and isinstance(callback, TensorBoardCallback):
             callback.log_dir = os.path.join(trainer.save_folder, "tensorboard")
 
-
     trainer.fit()
-    
-    log = logging.getLogger(__name__)
+
     log.info("Starting cleanup process...")
     
     log.info("Closing wandb...")
@@ -1673,6 +1821,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train OLMo model with streaming data")
     parser.add_argument("--run-name", type=str, default=None, help="Run name for this training")
     parser.add_argument("--save-root", type=str, default=None, help="Root directory under which checkpoints are saved in a run_name subdirectory")
+    parser.add_argument("--load-path", type=str, default=None, help="Checkpoint or run folder to resume from")
+    parser.add_argument(
+        "--load-strategy",
+        choices=[strategy.value for strategy in LoadStrategy],
+        default=LoadStrategy.never.value,
+        help="Checkpoint loading behavior before training starts",
+    )
     parser.add_argument("--micro-batch-size", type=int, default=None, help="Micro batch size per GPU")
     parser.add_argument("--streaming-data-path", nargs="*", default=None, help="Streaming data paths")
     parser.add_argument("--streaming-tokenizer-model", type=str, default=None, help="Tokenizer model path")
@@ -1752,15 +1907,15 @@ if __name__ == "__main__":
     
     overrides = unknown
 
-    prepare_training_environment()
-    torch.use_deterministic_algorithms(True)
-    try:
+    if args.print_resolved_config:
         main(
             run_name=args.run_name,
             streaming_data_path=args.streaming_data_path,
             streaming_tokenizer_model=args.streaming_tokenizer_model,
             streaming_ckpt_path=args.streaming_ckpt_path,
             save_root=args.save_root,
+            load_path=args.load_path,
+            load_strategy=args.load_strategy,
             micro_batch_size=args.micro_batch_size,
             streaming_text_chunk_queue_size=args.streaming_text_chunk_queue_size,
             streaming_text_chunk_size=args.streaming_text_chunk_size,
@@ -1773,5 +1928,29 @@ if __name__ == "__main__":
             print_resolved_config=args.print_resolved_config,
             overrides=overrides,
         )
-    finally:
-        teardown_training_environment()
+    else:
+        prepare_training_environment()
+        torch.use_deterministic_algorithms(True)
+        try:
+            main(
+                run_name=args.run_name,
+                streaming_data_path=args.streaming_data_path,
+                streaming_tokenizer_model=args.streaming_tokenizer_model,
+                streaming_ckpt_path=args.streaming_ckpt_path,
+                save_root=args.save_root,
+                load_path=args.load_path,
+                load_strategy=args.load_strategy,
+                micro_batch_size=args.micro_batch_size,
+                streaming_text_chunk_queue_size=args.streaming_text_chunk_queue_size,
+                streaming_text_chunk_size=args.streaming_text_chunk_size,
+                streaming_prefetch_queue_size=args.streaming_prefetch_queue_size,
+                streaming_use_token_column=args.streaming_use_token_column,
+                streaming_pack_method=args.streaming_pack_method,
+                config_path=args.config,
+                embedding_injection_yaml=args.embedding_injection_yaml,
+                launcher_mode=args.launcher_mode,
+                print_resolved_config=args.print_resolved_config,
+                overrides=overrides,
+            )
+        finally:
+            teardown_training_environment()

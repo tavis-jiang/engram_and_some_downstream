@@ -241,7 +241,22 @@ class TransformerEmbeddingInjectionConfig(Config):
     engram_ngram_heads: int = 8
     engram_ngram_target_buckets: Optional[int] = 75968
     engram_ngram_seed: int = 137
+    engram_targets: Optional[List[str]] = None
+    engram_use_compressed_lookup: bool = True
+    engram_shortconv_kernels: Optional[List[int]] = None
+    engram_legacy_h_path: bool = False
     mort_top_k: Optional[int] = None
+    comembed_variant: Optional[str] = None
+    comembed_codebook_size: int = 4096
+    comembed_residual_dim: int = 64
+    comembed_hidden_residual_dim: int = 128
+    comembed_row_permutation: str = "reverse"
+    comembed_pq_groups: int = 32
+    comembed_pq_split: Tuple[int, int, int, int] = (8, 12, 8, 4)
+    comembed_disable_shortconv: bool = True
+    comembed_gate_init: float = 0.01
+    comembed_disable_row_gate: bool = True
+    comembed_output_rmsnorm: bool = True
 
     def __post_init__(self):
         layer_fields = {
@@ -282,7 +297,7 @@ class TransformerEmbeddingInjectionConfig(Config):
                 )
             self.targets = normalized_targets
         mode = str(self.mode or "None").strip()
-        if mode in {"Retoken", "Mort", "Engram"}:
+        if mode in {"Retoken", "Mort"}:
             if not self.h_layers:
                 raise OLMoConfigurationError(
                     f"TransformerEmbeddingInjectionConfig.mode='{mode}' requires a non-empty h_layers. "
@@ -297,6 +312,15 @@ class TransformerEmbeddingInjectionConfig(Config):
                 raise OLMoConfigurationError(
                     f"TransformerEmbeddingInjectionConfig.mode='{mode}' only supports h_layers; "
                     f"unexpected non-empty layer fields: {unexpected_layer_fields}"
+                )
+        if mode == "Engram":
+            has_any_layer = any(
+                getattr(self, field_name)
+                for field_name in ("h_layers", "qk_layers", "q_layers", "k_layers", "v_layers", "o_layers")
+            )
+            if not has_any_layer:
+                raise OLMoConfigurationError(
+                    "TransformerEmbeddingInjectionConfig.mode='Engram' requires at least one non-empty layer list."
                 )
         if self.qk_sharing and (
             (self.q_layers is not None and len(self.q_layers) > 0)
@@ -359,6 +383,33 @@ class TransformerEmbeddingInjectionConfig(Config):
             raise OLMoConfigurationError(
                 "TransformerEmbeddingInjectionConfig.engram_ngram_target_buckets must be positive"
             )
+        mode = str(self.mode or "None").strip()
+        if mode == "ComEmbed":
+            variant = self.comembed_variant or "fa_qr"
+            valid_variants = {"qr_rev", "fa_add_qr", "fa_qr", "fa_norm_qr", "ctxmask_pq"}
+            if variant not in valid_variants:
+                raise OLMoConfigurationError(
+                    f"TransformerEmbeddingInjectionConfig.comembed_variant must be one of "
+                    f"{sorted(valid_variants)}, got {variant!r}"
+                )
+            if variant.startswith("fa_") and not self.hash_token_map_path:
+                raise OLMoConfigurationError(
+                    f"ComEmbed variant {variant!r} requires hash_token_map_path"
+                )
+            if self.comembed_codebook_size <= 0:
+                raise OLMoConfigurationError("comembed_codebook_size must be positive")
+            if self.comembed_residual_dim <= 0:
+                raise OLMoConfigurationError("comembed_residual_dim must be positive")
+            if self.comembed_hidden_residual_dim <= 0:
+                raise OLMoConfigurationError("comembed_hidden_residual_dim must be positive")
+            if self.comembed_pq_groups <= 0:
+                raise OLMoConfigurationError("comembed_pq_groups must be positive")
+            if len(self.comembed_pq_split) != 4 or sum(self.comembed_pq_split) != self.comembed_pq_groups:
+                raise OLMoConfigurationError(
+                    "comembed_pq_split must contain four integers that sum to comembed_pq_groups"
+                )
+            if self.comembed_gate_init < 0:
+                raise OLMoConfigurationError("comembed_gate_init must be non-negative")
         if self.mort_top_k is not None and self.mort_top_k <= 0:
             raise OLMoConfigurationError("TransformerEmbeddingInjectionConfig.mort_top_k must be positive")
 
@@ -807,14 +858,6 @@ class TransformerConfig(Config):
         if cfg is None:
             return 0, 0
 
-        h_layers = _resolve_layers(getattr(cfg, "h_layers", None), default_layers=list(cfg.layers))
-        if not h_layers:
-            return 0, 0
-        if len(set(h_layers)) != len(h_layers):
-            raise OLMoConfigurationError(
-                "Engram supports at most one module per layer; duplicate layer indices were provided"
-            )
-
         engram_mode = str(getattr(cfg, "engram_mode", "2gram+3gram"))
         mode_parts = {token.strip() for token in engram_mode.split("+") if token.strip()}
         ngram_levels = sorted(int(part.replace("gram", "")) for part in mode_parts)
@@ -841,12 +884,10 @@ class TransformerConfig(Config):
             raise OLMoConfigurationError("ENGRAM_NGRAM_TARGET_BUCKETS must be > 0")
 
         engram_hidden_size = len(ngram_levels) * dim_per_level
-        total = 0
-        embedding_like = 0
-        seen_primes: Set[int] = set()
         per_head_capacity = max(2, max(ngram_heads, target_capacity) // ngram_heads)
         align = 16
-        for _layer_idx in h_layers:
+
+        def _ngram_embedding_like(seen_primes: Set[int]) -> int:
             embedding_like_per_module = 0
             for _ in ngram_levels:
                 current = per_head_capacity
@@ -858,19 +899,245 @@ class TransformerConfig(Config):
                     current = prime + 1
                 total_embeddings = ((sum(primes) + align - 1) // align) * align
                 embedding_like_per_module += total_embeddings * (dim_per_level // ngram_heads)
+            return embedding_like_per_module
 
-            total_per_module = embedding_like_per_module
-            total_per_module += engram_hidden_size * self.d_model  # value_proj
-            total_per_module += hc_mult * engram_hidden_size * self.d_model  # key_projs
-            total_per_module += 2 * hc_mult * self.d_model  # norm1 + norm2
-            if bool(getattr(cfg, "engram_shortconv_enabled", True)):
-                kernel_size = int(getattr(cfg, "engram_shortconv_kernel", 4))
-                total_per_module += self.d_model * hc_mult * kernel_size  # depthwise conv
-                total_per_module += hc_mult * self.d_model  # per-hc RMSNorm weights
+        injection_targets = [
+            str(target).strip().lower()
+            for target in (
+                getattr(cfg, "engram_targets", None)
+                or getattr(cfg, "targets", None)
+                or ["h"]
+            )
+        ]
+        attention_targets = [target for target in injection_targets if target in _QKVO_TARGET_SET]
+        unsupported_attention_targets = set(attention_targets) - {"v"}
+        if unsupported_attention_targets:
+            raise OLMoConfigurationError(
+                f"Engram attention injection currently only supports 'v'; got {unsupported_attention_targets}"
+            )
 
-            total += total_per_module
-            embedding_like += embedding_like_per_module
+        default_h_layers = _resolve_layers(getattr(cfg, "h_layers", None), default_layers=list(cfg.layers))
+        h_layers = default_h_layers if "h" in injection_targets else []
+        v_layers = _resolve_layers(
+            getattr(cfg, "v_layers", None),
+            default_layers=default_h_layers if "v" in injection_targets else [],
+        )
 
+        total = 0
+        embedding_like = 0
+
+        if h_layers:
+            if len(set(h_layers)) != len(h_layers):
+                raise OLMoConfigurationError(
+                    "Engram supports at most one H-path module per layer; duplicate layer indices were provided"
+                )
+            seen_primes: Set[int] = set()
+            for _layer_idx in h_layers:
+                embedding_like_per_module = _ngram_embedding_like(seen_primes)
+
+                total_per_module = embedding_like_per_module
+                total_per_module += engram_hidden_size * self.d_model  # value_proj
+                total_per_module += hc_mult * engram_hidden_size * self.d_model  # key_projs
+                total_per_module += 2 * hc_mult * self.d_model  # norm1 + norm2
+                total_per_module += 1  # external lambda gate
+                if bool(getattr(cfg, "engram_shortconv_enabled", True)):
+                    kernel_size = int(getattr(cfg, "engram_shortconv_kernel", 4))
+                    total_per_module += self.d_model * hc_mult * kernel_size  # depthwise conv
+                    total_per_module += hc_mult * self.d_model  # per-hc RMSNorm weights
+
+                total += total_per_module
+                embedding_like += embedding_like_per_module
+
+        if v_layers:
+            seen_primes = set()
+            shortconv_enabled = bool(getattr(cfg, "engram_shortconv_enabled", True))
+            shortconv_kernels = list(getattr(cfg, "engram_shortconv_kernels", None) or [4])
+            for kernel_size in shortconv_kernels:
+                if int(kernel_size) <= 0:
+                    raise OLMoConfigurationError(
+                        "TransformerEmbeddingInjectionConfig.engram_shortconv_kernels must contain positive integers"
+                    )
+            for layer_idx in v_layers:
+                target_dim = _attention_injection_dim(
+                    self.d_model,
+                    self._block_config_for_layer(layer_idx).attention,
+                )
+                embedding_like_per_module = _ngram_embedding_like(seen_primes)
+
+                total_per_module = embedding_like_per_module
+                total_per_module += engram_hidden_size * target_dim  # value_proj
+                total_per_module += 1  # external lambda gate
+                if shortconv_enabled:
+                    for kernel_size in shortconv_kernels:
+                        total_per_module += _swiglu_shortconv_num_params(
+                            engram_hidden_size,
+                            int(kernel_size),
+                        )
+
+                total += total_per_module
+                embedding_like += embedding_like_per_module
+
+        return total, embedding_like
+
+    def _comembed_lookup_param_count(self, *, dim: int, target_label: str, hash_total_capacity: Optional[int]) -> int:
+        cfg = self.embedding_injection
+        if cfg is None:
+            return 0
+        variant = str(getattr(cfg, "comembed_variant", None) or "fa_qr")
+        codebook_size = int(getattr(cfg, "comembed_codebook_size", 4096))
+        residual_dim = (
+            int(getattr(cfg, "comembed_hidden_residual_dim", getattr(cfg, "comembed_residual_dim", 64)))
+            if target_label in {"h", "o"}
+            else int(getattr(cfg, "comembed_residual_dim", 64))
+        )
+        if variant == "ctxmask_pq":
+            groups = int(getattr(cfg, "comembed_pq_groups", 32))
+            if dim % groups != 0:
+                raise OLMoConfigurationError(
+                    f"ComEmbed ctxmask_pq dim ({dim}) must be divisible by groups ({groups})"
+                )
+            return codebook_size * dim
+        if variant == "qr_rev":
+            num_codes = (self.vocab_size + codebook_size - 1) // codebook_size
+            return (
+                codebook_size * dim
+                + num_codes * dim
+                + 1
+                + self.vocab_size * residual_dim
+                + residual_dim * dim
+            )
+        if variant in {"fa_add_qr", "fa_qr", "fa_norm_qr"}:
+            if hash_total_capacity is None:
+                token_map_path = getattr(cfg, "hash_token_map_path", None)
+                if not token_map_path:
+                    raise OLMoConfigurationError(
+                        f"ComEmbed variant {variant!r} requires hash_token_map_path for parameter counting"
+                    )
+                hash_total_capacity = _load_hash_token_map_total_capacity(str(token_map_path))
+            num_codes = (hash_total_capacity + codebook_size - 1) // codebook_size
+            beta_params = 0 if variant == "fa_add_qr" else 1
+            return (
+                codebook_size * dim
+                + num_codes * dim
+                + beta_params
+                + hash_total_capacity
+                + hash_total_capacity * residual_dim
+                + residual_dim * dim
+            )
+        raise OLMoConfigurationError(f"Unknown ComEmbed variant: {variant}")
+
+    def _comembed_injection_param_counts(self) -> Tuple[int, int]:
+        cfg = self.embedding_injection
+        if cfg is None:
+            return 0, 0
+
+        injection_targets = list(cfg.targets or ["h"])
+        attention_targets = [target for target in injection_targets if target in _QKVO_TARGET_SET]
+        h_target_enabled = "h" in injection_targets
+        attention_qkv_targets = [target for target in attention_targets if target in {"q", "k", "v"}]
+        attention_qkv_target_set = set(attention_qkv_targets)
+        attention_qk_sharing_active = cfg.qk_sharing and {"q", "k"}.issubset(attention_qkv_target_set)
+
+        default_h_layers = _resolve_layers(getattr(cfg, "h_layers", None), default_layers=list(cfg.layers))
+        default_qkv_layers = default_h_layers
+        configured_qk_layers = list(cfg.qk_layers) if cfg.qk_layers is not None else None
+        target_layers = {
+            "q": _resolve_layers(
+                configured_qk_layers if attention_qk_sharing_active else getattr(cfg, "q_layers", None),
+                default_layers=default_qkv_layers if "q" in attention_targets else [],
+            ),
+            "k": _resolve_layers(
+                configured_qk_layers if attention_qk_sharing_active else getattr(cfg, "k_layers", None),
+                default_layers=default_qkv_layers if "k" in attention_targets else [],
+            ),
+            "v": _resolve_layers(
+                getattr(cfg, "v_layers", None),
+                default_layers=default_qkv_layers if "v" in attention_targets else [],
+            ),
+            "o": _resolve_layers(
+                getattr(cfg, "o_layers", None),
+                default_layers=default_h_layers if "o" in attention_targets else [],
+            ),
+        }
+
+        hash_total_capacity: Optional[int] = None
+        if str(getattr(cfg, "comembed_variant", None) or "fa_qr").startswith("fa_"):
+            token_map_path = getattr(cfg, "hash_token_map_path", None)
+            if not token_map_path:
+                raise OLMoConfigurationError("ComEmbed frequency-aware variants require hash_token_map_path")
+            hash_total_capacity = _load_hash_token_map_total_capacity(str(token_map_path))
+
+        shortconv_enabled = bool(getattr(cfg, "shortconv_enabled", False))
+        kernels = list(getattr(cfg, "shortconv_kernels", None) or [3, 5, 7, 9])
+
+        def _count_layers(layers: List[int], *, dim: int, target_label: str) -> Tuple[int, int]:
+            total = 0
+            embedding_like = 0
+            per_block_counts: Dict[int, int] = {}
+            for layer_idx in layers:
+                lookup_params = self._comembed_lookup_param_count(
+                    dim=dim,
+                    target_label=target_label,
+                    hash_total_capacity=hash_total_capacity,
+                )
+                embedding_like += lookup_params
+                total += lookup_params + 1
+                if shortconv_enabled:
+                    conv_idx = per_block_counts.get(layer_idx, 0)
+                    kernel_size = kernels[conv_idx % len(kernels)]
+                    total += _swiglu_shortconv_num_params(dim, kernel_size)
+                    per_block_counts[layer_idx] = conv_idx + 1
+            return total, embedding_like
+
+        total = 0
+        embedding_like = 0
+        if h_target_enabled:
+            h_total, h_embedding_like = _count_layers(default_h_layers, dim=self.d_model, target_label="h")
+            total += h_total
+            embedding_like += h_embedding_like
+
+        attention_dim_by_layer = {
+            layer_idx: _attention_injection_dim(
+                self.d_model,
+                self._block_config_for_layer(layer_idx).attention,
+            )
+            for layer_idx in set(target_layers["q"] + target_layers["k"] + target_layers["v"])
+        }
+        qkv_specs: List[Tuple[str, List[int]]] = []
+        if attention_qk_sharing_active:
+            qkv_specs.append(("qk", target_layers["q"]))
+        else:
+            for target in attention_qkv_targets:
+                qkv_specs.append((target, target_layers[target]))
+        if "v" in attention_qkv_target_set and all(label != "v" for label, _ in qkv_specs):
+            qkv_specs.append(("v", target_layers["v"]))
+
+        for target_label, layers in qkv_specs:
+            if not layers:
+                continue
+            target_total = 0
+            target_embedding_like = 0
+            per_block_counts: Dict[int, int] = {}
+            for layer_idx in layers:
+                dim = attention_dim_by_layer[layer_idx]
+                lookup_params = self._comembed_lookup_param_count(
+                    dim=dim,
+                    target_label=target_label,
+                    hash_total_capacity=hash_total_capacity,
+                )
+                target_embedding_like += lookup_params
+                target_total += lookup_params + 1
+                if shortconv_enabled:
+                    conv_idx = per_block_counts.get(layer_idx, 0)
+                    kernel_size = kernels[conv_idx % len(kernels)]
+                    target_total += _swiglu_shortconv_num_params(dim, kernel_size)
+                    per_block_counts[layer_idx] = conv_idx + 1
+            total += target_total
+            embedding_like += target_embedding_like
+
+        o_total, o_embedding_like = _count_layers(target_layers["o"], dim=self.d_model, target_label="o")
+        total += o_total
+        embedding_like += o_embedding_like
         return total, embedding_like
 
     def _fallback_injection_param_counts(self) -> Tuple[int, int]:
@@ -896,6 +1163,8 @@ class TransformerConfig(Config):
             return self._mort_injection_param_counts()
         if mode == "Engram":
             return self._engram_injection_param_counts()
+        if mode == "ComEmbed":
+            return self._comembed_injection_param_counts()
         return self._fallback_injection_param_counts()
 
     @property

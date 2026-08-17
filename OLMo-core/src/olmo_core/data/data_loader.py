@@ -5,6 +5,7 @@ Distributed, deterministic, stateful data loaders used by the :class:`~olmo_core
 
 import logging
 import math
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from itertools import islice
@@ -1196,7 +1197,21 @@ class UBDataLoader(DataLoaderBase):
 
     def load_state_dict(self, state_dict: Dict[str, Any]):
         self.consumed_samples = state_dict["consumed_samples"]
-        self._init_data_loader(self.consumed_samples)
+        try:
+            self._init_data_loader(self.consumed_samples)
+        except Exception as exc:
+            allow_missing_ckpt = os.environ.get("OLMO_ALLOW_MISSING_DATALOADER_CKPT", "0").lower()
+            if allow_missing_ckpt in {"1", "true", "yes", "y", "on"}:
+                log.warning(
+                    "Falling back to a fresh data loader because restoring the streaming "
+                    "checkpoint failed for consumed_samples=%s: %s",
+                    self.consumed_samples,
+                    exc,
+                )
+                self.consumed_samples = 0
+                self._init_data_loader(self.consumed_samples)
+            else:
+                raise
 
     def _iter_batches(self) -> Iterable[Dict[str, Any]]:
         if self.data_loader is None:

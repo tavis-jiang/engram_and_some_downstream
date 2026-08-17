@@ -7,7 +7,16 @@ import torch.nn as nn
 from olmo_core.exceptions import OLMoConfigurationError
 
 from ..attention import ShortConvParams, compute_injection_delta
-from .ops.hash_injection import HashTokenMapInjection
+from .comembed import (
+    ContextMaskNgramPQLookup,
+    FrequencyAwareQRLookup,
+    QRAddNormProductRowMemory,
+    QRAddProductResidualLookup,
+    QRAddResidualRowMemory,
+    QRRowMemory,
+    sanitize_comembed_grad,
+)
+from .ops.hash_injection import HashTokenMapInjection, HashTokenRouter
 from .ops.shortconv import SwiGLUShortConv
 from .runtime import (
     InjectionBlockContext,
@@ -359,6 +368,372 @@ def build_xgram_modules(
                 transformer._injection_h_shortconvs[block_key].append(conv)
 
             transformer._injection_h_embeddings[block_key].append(injection_embedding)
+
+
+def build_comembed_modules(
+    transformer: Any,
+    embedding_injection: Any,
+    *,
+    vocab_size: int,
+    d_model: int,
+    n_layers: int,
+    dtype: torch.dtype,
+    init_device: str,
+    init_std: float,
+    hash_num_heads: int,
+    hash_multipliers: List[int],
+) -> None:
+    def resolve_attention_injection_dim(attention_cfg: Any) -> int:
+        n_heads_cfg = getattr(attention_cfg, "n_heads", None) or 0
+        n_kv_heads_cfg = getattr(attention_cfg, "n_kv_heads", None)
+        n_heads = n_heads_cfg
+        if n_heads <= 0:
+            raise OLMoConfigurationError("ComEmbed attention injection requires a valid attention.n_heads")
+        n_kv_heads = n_kv_heads_cfg or n_heads
+        if n_kv_heads <= 0:
+            raise OLMoConfigurationError("ComEmbed attention injection requires a valid attention.n_kv_heads")
+        if n_heads % n_kv_heads != 0:
+            raise OLMoConfigurationError(
+                f"NUM_ATTN_HEADS ({n_heads}) must be divisible by n_kv_heads ({n_kv_heads})"
+            )
+        if d_model % n_heads != 0:
+            raise OLMoConfigurationError(
+                f"d_model ({d_model}) must be divisible by NUM_ATTN_HEADS ({n_heads})"
+            )
+        head_dim = d_model // n_heads
+        return n_kv_heads * head_dim
+
+    variant = str(getattr(embedding_injection, "comembed_variant", None) or "fa_qr").strip()
+    comembed_disable_shortconv = bool(
+        getattr(embedding_injection, "comembed_disable_shortconv", True)
+    )
+    comembed_gate_init = float(getattr(embedding_injection, "comembed_gate_init", 0.01) or 0.01)
+    comembed_disable_row_gate = bool(
+        getattr(embedding_injection, "comembed_disable_row_gate", True)
+    )
+    comembed_output_rmsnorm = bool(
+        getattr(embedding_injection, "comembed_output_rmsnorm", True)
+    )
+    codebook_size = int(getattr(embedding_injection, "comembed_codebook_size", 4096) or 4096)
+    residual_dim = int(getattr(embedding_injection, "comembed_residual_dim", 64) or 64)
+    hidden_residual_dim = int(
+        getattr(embedding_injection, "comembed_hidden_residual_dim", residual_dim) or residual_dim
+    )
+    row_permutation = str(getattr(embedding_injection, "comembed_row_permutation", "reverse") or "reverse")
+    pq_groups = int(getattr(embedding_injection, "comembed_pq_groups", 32) or 32)
+    pq_split = tuple(int(x) for x in getattr(embedding_injection, "comembed_pq_split", (8, 12, 8, 4)))
+
+    token_map_path_raw = getattr(embedding_injection, "hash_token_map_path", None)
+    token_map_path = Path(token_map_path_raw) if token_map_path_raw else None
+    if variant.startswith("fa_") and (token_map_path is None or not token_map_path.exists()):
+        raise OLMoConfigurationError(
+            f"ComEmbed variant '{variant}' requires a valid hash_token_map_path"
+        )
+
+    attention_qkv_targets = [t for t in transformer._attention_injection_targets if t in {"q", "k", "v"}]
+    attention_qkv_target_set = set(attention_qkv_targets)
+    attention_has_qkv = any(t in {"q", "k", "v"} for t in transformer._attention_injection_targets)
+    attention_qk_sharing_active = (
+        transformer._attention_qk_sharing and {"q", "k"}.issubset(attention_qkv_target_set)
+    )
+
+    default_h_layers = resolve_configured_layers(
+        getattr(embedding_injection, "h_layers", None),
+        default_layers=list(embedding_injection.layers),
+    )
+    h_injection_layers = list(default_h_layers)
+    default_qkv_layers = default_h_layers
+    configured_qk_layers = resolve_configured_layers(
+        getattr(embedding_injection, "qk_layers", None),
+        default_layers=None,
+    )
+    target_injection_layers: Dict[str, List[int]] = {
+        "q": resolve_configured_layers(
+            configured_qk_layers if attention_qk_sharing_active else getattr(embedding_injection, "q_layers", None),
+            default_layers=default_qkv_layers if "q" in transformer._attention_injection_targets else [],
+        ),
+        "k": resolve_configured_layers(
+            configured_qk_layers if attention_qk_sharing_active else getattr(embedding_injection, "k_layers", None),
+            default_layers=default_qkv_layers if "k" in transformer._attention_injection_targets else [],
+        ),
+        "v": resolve_configured_layers(
+            getattr(embedding_injection, "v_layers", None),
+            default_layers=default_qkv_layers if "v" in transformer._attention_injection_targets else [],
+        ),
+        "o": resolve_configured_layers(
+            getattr(embedding_injection, "o_layers", None),
+            default_layers=default_h_layers if "o" in transformer._attention_injection_targets else [],
+        ),
+    }
+
+    validate_injection_layers("COMEMBED_H_LAYERS", h_injection_layers, n_layers=n_layers)
+    validate_injection_layers("COMEMBED_QK_LAYERS", configured_qk_layers, n_layers=n_layers)
+    for target_label, target_layers in target_injection_layers.items():
+        validate_injection_layers(
+            f"COMEMBED_{target_label.upper()}_LAYERS",
+            target_layers,
+            n_layers=n_layers,
+        )
+
+    if (
+        transformer._attention_qk_sharing
+        and configured_qk_layers
+        and (getattr(embedding_injection, "q_layers", None) or getattr(embedding_injection, "k_layers", None))
+    ):
+        raise OLMoConfigurationError(
+            "ComEmbed qk_sharing=True does not allow q_layers or k_layers. Use qk_layers instead."
+        )
+    if transformer._attention_qk_sharing and target_injection_layers["q"] != target_injection_layers["k"]:
+        raise OLMoConfigurationError("ComEmbed qk_sharing=True requires matching q/k layer occurrences")
+
+    def qkv_container_triplet(target_label: str) -> Tuple[nn.ModuleDict, nn.ModuleDict, nn.ModuleDict]:
+        if target_label == "qk":
+            return (
+                transformer._injection_qk_embeddings,
+                transformer._injection_qk_gates,
+                transformer._injection_qk_shortconvs,
+            )
+        if target_label == "q":
+            return (
+                transformer._injection_q_embeddings,
+                transformer._injection_q_gates,
+                transformer._injection_q_shortconvs,
+            )
+        if target_label == "k":
+            return (
+                transformer._injection_k_embeddings,
+                transformer._injection_k_gates,
+                transformer._injection_k_shortconvs,
+            )
+        if target_label == "v":
+            return (
+                transformer._injection_v_embeddings,
+                transformer._injection_v_gates,
+                transformer._injection_v_shortconvs,
+            )
+        raise OLMoConfigurationError(f"Unsupported ComEmbed attention target label '{target_label}'")
+
+    def build_lookup(*, dim: int, module_idx: int, target_label: str) -> nn.Module:
+        target_residual_dim = hidden_residual_dim if target_label in {"h", "o"} else residual_dim
+        comembed_dtype = torch.float32
+        if variant == "qr_rev":
+            return QRAddProductResidualLookup(
+                vocab_size=vocab_size,
+                dim=dim,
+                codebook_size=codebook_size,
+                residual_dim=target_residual_dim,
+                permutation=row_permutation,
+                init_std=init_std,
+                device=init_device,
+                dtype=comembed_dtype,
+            )
+        if variant == "ctxmask_pq":
+            return ContextMaskNgramPQLookup(
+                vocab_size=vocab_size,
+                dim=dim,
+                codebook_size=codebook_size,
+                groups=pq_groups,
+                split=pq_split,  # type: ignore[arg-type]
+                device=init_device,
+                dtype=comembed_dtype,
+            )
+
+        if token_map_path is None:
+            raise OLMoConfigurationError(f"ComEmbed variant '{variant}' requires hash_token_map_path")
+        hash_multipliers_vn = [
+            hash_multipliers[(module_idx * hash_num_heads + i) % len(hash_multipliers)]
+            for i in range(hash_num_heads)
+        ]
+        router = HashTokenRouter(
+            vocab_size=vocab_size,
+            init_device=init_device,
+            token_map_path=token_map_path,
+            num_buckets=None,
+            top_k_count=None,
+            hash_multipliers=hash_multipliers_vn,
+        )
+        if variant == "fa_add_qr":
+            row_memory_cls = QRAddResidualRowMemory
+            row_memory_kwargs = {
+                "disable_row_gate": comembed_disable_row_gate,
+                "output_rmsnorm": comembed_output_rmsnorm,
+            }
+        elif variant == "fa_qr":
+            row_memory_cls = QRRowMemory
+            row_memory_kwargs = {
+                "row_permutation": row_permutation,
+                "disable_row_gate": comembed_disable_row_gate,
+                "output_rmsnorm": comembed_output_rmsnorm,
+            }
+        elif variant == "fa_norm_qr":
+            row_memory_cls = QRAddNormProductRowMemory
+            row_memory_kwargs = {
+                "disable_row_gate": comembed_disable_row_gate,
+                "output_rmsnorm": comembed_output_rmsnorm,
+            }
+        else:
+            raise OLMoConfigurationError(f"Unknown ComEmbed variant: {variant}")
+        return FrequencyAwareQRLookup(
+            router=router,
+            dim=dim,
+            codebook_size=codebook_size,
+            residual_dim=target_residual_dim,
+            row_memory_cls=row_memory_cls,
+            row_memory_kwargs=row_memory_kwargs,
+            init_std=init_std,
+            device=init_device,
+            dtype=comembed_dtype,
+        )
+
+    if attention_has_qkv:
+        qkv_specs: List[Tuple[str, List[int]]] = []
+        if attention_qk_sharing_active:
+            qkv_specs.append(("qk", target_injection_layers["q"]))
+        else:
+            for target_label in attention_qkv_targets:
+                qkv_specs.append((target_label, target_injection_layers[target_label]))
+        if "v" in attention_qkv_target_set and all(spec[0] != "v" for spec in qkv_specs):
+            qkv_specs.append(("v", target_injection_layers["v"]))
+
+        for target_label, target_layers in qkv_specs:
+            emb_dict, gate_dict, shortconv_dict = qkv_container_triplet(target_label)
+            for layer_idx in target_layers:
+                block_key = str(layer_idx)
+                if block_key not in emb_dict:
+                    emb_dict[block_key] = nn.ModuleList()
+                    gate_dict[block_key] = nn.ParameterList()
+                if transformer._shortconv_enabled and not comembed_disable_shortconv:
+                    shortconv_dict[block_key] = nn.ModuleList()
+
+                embedding_dim = resolve_attention_injection_dim(transformer.blocks[block_key].attention)
+                module_idx = len(emb_dict[block_key])
+                emb_dict[block_key].append(
+                    build_lookup(dim=embedding_dim, module_idx=module_idx, target_label=target_label)
+                )
+
+                gate_param = nn.Parameter(torch.empty(1, dtype=torch.float32, device=init_device))
+                if not gate_param.is_meta:
+                    gate_param.data.fill_(comembed_gate_init)
+                gate_param.register_hook(sanitize_comembed_grad)
+                gate_dict[block_key].append(gate_param)
+                gate_idx = len(gate_dict[block_key]) - 1
+                transformer._register_injection_depth_scale(
+                    block_key=f"{target_label}_{block_key}",
+                    gate_idx=gate_idx,
+                    layer_idx=layer_idx,
+                    device=init_device,
+                    dtype=torch.float32,
+                )
+
+                if transformer._shortconv_enabled and not comembed_disable_shortconv:
+                    conv_idx = len(shortconv_dict[block_key])
+                    kernel_size = transformer._sc_multi_scale_kernels[
+                        conv_idx % len(transformer._sc_multi_scale_kernels)
+                    ]
+                    shared_conv = SwiGLUShortConv(
+                        embedding_dim,
+                        kernel_size=kernel_size,
+                        device=init_device,
+                        dtype=dtype,
+                    )
+                    if not shared_conv.conv_content.weight.is_meta:
+                        shared_conv.conv_content.weight.data.zero_()
+                        shared_conv.conv_content.weight.data[:, :, -1] = 1.0
+                        nn.init.normal_(shared_conv.conv_gate.weight, mean=0.0, std=transformer.init_std)
+                        if shared_conv.conv_gate.bias is not None:
+                            shared_conv.conv_gate.bias.data.fill_(transformer._sc_swiglu_gate_bias)
+                    shortconv_dict[block_key].append(shared_conv)
+
+    if "o" in transformer._attention_injection_targets:
+        for layer_idx in target_injection_layers["o"]:
+            block_key = str(layer_idx)
+            if block_key not in transformer._injection_o_embeddings:
+                transformer._injection_o_embeddings[block_key] = nn.ModuleList()
+                transformer._injection_o_gates[block_key] = nn.ParameterList()
+                transformer._injection_o_shortconvs[block_key] = nn.ModuleList()
+            module_idx = len(transformer._injection_o_embeddings[block_key])
+            transformer._injection_o_embeddings[block_key].append(
+                build_lookup(dim=d_model, module_idx=module_idx, target_label="o")
+            )
+            o_gate = nn.Parameter(torch.empty(1, dtype=torch.float32, device=init_device))
+            if not o_gate.is_meta:
+                o_gate.data.fill_(comembed_gate_init)
+            o_gate.register_hook(sanitize_comembed_grad)
+            o_gate_idx = len(transformer._injection_o_gates[block_key])
+            transformer._injection_o_gates[block_key].append(o_gate)
+            transformer._register_injection_depth_scale(
+                block_key=f"o_{block_key}",
+                gate_idx=o_gate_idx,
+                layer_idx=layer_idx,
+                device=init_device,
+                dtype=torch.float32,
+            )
+            if transformer._shortconv_enabled and not comembed_disable_shortconv:
+                conv_idx = len(transformer._injection_o_shortconvs[block_key])
+                kernel_size = transformer._sc_multi_scale_kernels[
+                    conv_idx % len(transformer._sc_multi_scale_kernels)
+                ]
+                conv_o = SwiGLUShortConv(
+                    d_model,
+                    kernel_size=kernel_size,
+                    device=init_device,
+                    dtype=dtype,
+                )
+                if not conv_o.conv_content.weight.is_meta:
+                    conv_o.conv_content.weight.data.zero_()
+                    conv_o.conv_content.weight.data[:, :, -1] = 1.0
+                    nn.init.normal_(conv_o.conv_gate.weight, mean=0.0, std=transformer.init_std)
+                    if conv_o.conv_gate.bias is not None:
+                        conv_o.conv_gate.bias.data.fill_(transformer._sc_swiglu_gate_bias)
+                transformer._injection_o_shortconvs[block_key].append(conv_o)
+
+    if transformer._h_target_enabled:
+        for layer_idx in h_injection_layers:
+            block_key = str(layer_idx)
+            if block_key not in transformer._injection_h_embeddings:
+                transformer._injection_h_embeddings[block_key] = nn.ModuleList()
+                transformer._injection_h_gates[block_key] = nn.ParameterList()
+                if transformer._shortconv_enabled:
+                    transformer._injection_h_shortconvs[block_key] = nn.ModuleList()
+
+            module_idx = len(transformer._injection_h_embeddings[block_key])
+            transformer._injection_h_embeddings[block_key].append(
+                build_lookup(dim=d_model, module_idx=module_idx, target_label="h")
+            )
+            gate_value = comembed_gate_init
+            gate_param = nn.Parameter(torch.empty(1, dtype=torch.float32, device=init_device))
+            if not gate_param.is_meta:
+                gate_param.data.fill_(gate_value)
+            gate_param.register_hook(sanitize_comembed_grad)
+            transformer._injection_h_gate_defaults.setdefault(block_key, []).append(gate_value)
+            transformer._injection_h_gates[block_key].append(gate_param)
+            gate_idx = len(transformer._injection_h_gates[block_key]) - 1
+            transformer._register_injection_depth_scale(
+                block_key=block_key,
+                gate_idx=gate_idx,
+                layer_idx=layer_idx,
+                device=init_device,
+                dtype=torch.float32,
+            )
+
+            if transformer._shortconv_enabled and not comembed_disable_shortconv:
+                conv_idx = len(transformer._injection_h_shortconvs[block_key])
+                kernel_size = transformer._sc_multi_scale_kernels[
+                    conv_idx % len(transformer._sc_multi_scale_kernels)
+                ]
+                conv = SwiGLUShortConv(
+                    d_model,
+                    kernel_size=kernel_size,
+                    device=init_device,
+                    dtype=dtype,
+                )
+                if not conv.conv_content.weight.is_meta:
+                    conv.conv_content.weight.data.zero_()
+                    conv.conv_content.weight.data[:, :, -1] = 1.0
+                    nn.init.normal_(conv.conv_gate.weight, mean=0.0, std=transformer.init_std)
+                    if conv.conv_gate.bias is not None:
+                        conv.conv_gate.bias.data.fill_(transformer._sc_swiglu_gate_bias)
+                transformer._injection_h_shortconvs[block_key].append(conv)
 
 
 def _collect_depth_scales(

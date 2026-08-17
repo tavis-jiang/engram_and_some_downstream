@@ -13,17 +13,30 @@ from olmo_core.distributed.utils import distribute_like
 from olmo_core.exceptions import OLMoConfigurationError
 from olmo_core.utils import get_default_device
 
+from ..attention import ShortConvParams, compute_shortconv_delta
+from .ops.shortconv import SwiGLUShortConv
 from .runtime import InjectionBlockContext, resolve_configured_layers
 
 log = logging.getLogger(__name__)
 
 
 def _build_compressed_lookup_table(
-    *, tokenizer_id: str, vocab_size: int, cache_path: Optional[Union[str, Path]] = None
+    *,
+    tokenizer_id: str,
+    vocab_size: int,
+    cache_path: Optional[Union[str, Path]] = None,
+    use_compressed_lookup: bool = True,
 ) -> torch.Tensor:
     """
     Build a lookup tensor that maps original tokenizer IDs to normalized/merged IDs.
+
+    When ``use_compressed_lookup`` is False, returns an identity mapping so that
+    the raw tokenizer IDs are used directly by the n-gram hashers.
     """
+    if not use_compressed_lookup:
+        log.info("Compressed token lookup disabled; using identity mapping")
+        return torch.arange(vocab_size, dtype=torch.long)
+
     try:
         from transformers import AutoTokenizer  # type: ignore
         from tokenizers import normalizers, Regex  # type: ignore
@@ -183,7 +196,8 @@ class EngramNgramHash(nn.Module):
         gen = torch.Generator()
         gen.manual_seed(seed)
         max_long = (1 << 63) - 1
-        half_bound = max(1, max_long // vocab_size // 2)
+        # Keep the product (token_id * multiplier) well below max_long to avoid overflow.
+        half_bound = max(1, max_long // vocab_size // 4)
         r = torch.randint(0, half_bound, (ngram_size,), generator=gen, dtype=torch.long)
         multipliers = r.mul(2).add(1)  # ensure odd
         self._multiplier_values = tuple(int(v) for v in multipliers.tolist())
@@ -318,6 +332,7 @@ class EngramModule(nn.Module):
         ngram_base_seed: int = 0,
         ngram_pad_id: int = 0,
         seen_primes: Optional[Set[int]] = None,
+        use_compressed_lookup: bool = True,
     ):
         super().__init__()
         if ngram_levels is None or len(ngram_levels) == 0:
@@ -342,11 +357,13 @@ class EngramModule(nn.Module):
         self.hc_mult = hc_mult
         self.shortconv_enabled = shortconv_enabled
         self.ngram_levels = sorted(ngram_levels)
+        self._use_compressed_lookup = use_compressed_lookup
 
         lookup = _build_compressed_lookup_table(
             tokenizer_id=tokenizer_id,
             vocab_size=vocab_size,
             cache_path=cache_path,
+            use_compressed_lookup=use_compressed_lookup,
         )
         self.register_buffer("lookup_table", lookup, persistent=False)
         compressed_vocab_size = int(lookup.numel())
@@ -424,6 +441,7 @@ class EngramModule(nn.Module):
             tokenizer_id=self._tokenizer_id,
             vocab_size=self._vocab_size,
             cache_path=self._cache_path,
+            use_compressed_lookup=self._use_compressed_lookup,
         ).to(device=target_device, dtype=torch.long)
         existing = getattr(self, "lookup_table", None)
         if existing is None or "lookup_table" not in self._buffers:
@@ -497,6 +515,171 @@ class EngramModule(nn.Module):
         return output
 
 
+class EngramInjectionEmbedding(nn.Module):
+    """
+    Engram n-gram lookup embedding suitable for X-gram-style injection targets
+    (attention q/k/v/o paths or hidden residual paths).
+
+    The module performs:
+        1. compressed token lookup (optional)
+        2. per-level n-gram hash + embedding retrieval
+        3. concatenation of n-gram levels
+        4. optional multi-scale ShortConv refinement
+        5. linear projection to the target dimension
+
+    The returned tensor has shape ``(batch, seq_len, target_dim)`` and can be
+    consumed directly by ``compute_injection_delta``.
+    """
+
+    def __init__(
+        self,
+        *,
+        d_model: int,
+        target_dim: int,
+        vocab_size: int,
+        tokenizer_id: str,
+        cache_path: Optional[str],
+        init_device: str,
+        dtype: torch.dtype,
+        ngram_levels: List[int],
+        ngram_dim_per_level: int,
+        ngram_heads_per_level: int = 4,
+        ngram_target_capacity: int = 0,
+        ngram_base_seed: int = 0,
+        ngram_pad_id: int = 0,
+        seen_primes: Optional[Set[int]] = None,
+        shortconv_enabled: bool = True,
+        shortconv_kernels: Optional[List[int]] = None,
+        shortconv_rmsnorm_eps: float = 1e-5,
+        use_compressed_lookup: bool = True,
+    ):
+        super().__init__()
+        if not ngram_levels or any(level < 2 for level in ngram_levels):
+            raise OLMoConfigurationError("EngramInjectionEmbedding requires n-gram levels >= 2")
+        if ngram_dim_per_level < 1:
+            raise OLMoConfigurationError("ngram_dim_per_level must be >= 1")
+        if ngram_heads_per_level < 1:
+            raise OLMoConfigurationError("ngram_heads_per_level must be >= 1")
+        if ngram_dim_per_level % ngram_heads_per_level != 0:
+            raise OLMoConfigurationError(
+                f"ngram_dim_per_level ({ngram_dim_per_level}) must be divisible by heads ({ngram_heads_per_level})"
+            )
+        if ngram_target_capacity < 1:
+            raise OLMoConfigurationError("ngram_target_capacity must be > 0")
+
+        self.d_model = d_model
+        self.target_dim = target_dim
+        self.ngram_levels = sorted(ngram_levels)
+        self.shortconv_enabled = shortconv_enabled
+        self.shortconv_rmsnorm_eps = shortconv_rmsnorm_eps
+        self._use_compressed_lookup = use_compressed_lookup
+        self._tokenizer_id = tokenizer_id
+        self._cache_path = cache_path
+        self._vocab_size = vocab_size
+
+        lookup = _build_compressed_lookup_table(
+            tokenizer_id=tokenizer_id,
+            vocab_size=vocab_size,
+            cache_path=cache_path,
+            use_compressed_lookup=use_compressed_lookup,
+        )
+        self.register_buffer("lookup_table", lookup, persistent=False)
+        compressed_vocab_size = int(lookup.numel())
+
+        self.ngram_hashers = nn.ModuleList()
+        self.ngram_embeddings = nn.ModuleList()
+        ngram_total_hidden = 0
+        _ngram_pad = int(lookup[ngram_pad_id].item()) if ngram_pad_id < lookup.numel() else 0
+
+        for level in self.ngram_levels:
+            level_seed = ngram_base_seed + 7919 * (level - 1)
+            hasher = EngramNgramHash(
+                vocab_size=compressed_vocab_size,
+                num_heads=ngram_heads_per_level,
+                target_total_capacity=ngram_target_capacity,
+                ngram_size=level,
+                pad_id=_ngram_pad,
+                seed=level_seed,
+                seen_primes=seen_primes,
+            )
+            self.ngram_hashers.append(hasher)
+            level_head_dim = ngram_dim_per_level // ngram_heads_per_level
+            emb = nn.Embedding(
+                hasher.total_embeddings,
+                level_head_dim,
+                dtype=dtype,
+                device=init_device,
+            )
+            self.ngram_embeddings.append(emb)
+            ngram_total_hidden += ngram_dim_per_level
+
+        self.value_proj = nn.Linear(ngram_total_hidden, target_dim, bias=False, dtype=dtype, device=init_device)
+
+        self.short_convs: Optional[nn.ModuleList] = None
+        if shortconv_enabled and shortconv_kernels:
+            self.short_convs = nn.ModuleList([
+                SwiGLUShortConv(
+                    ngram_total_hidden,
+                    kernel_size=k,
+                    device=init_device,
+                    dtype=dtype,
+                )
+                for k in shortconv_kernels
+            ])
+            for conv in self.short_convs:
+                if not conv.conv_content.weight.is_meta:
+                    conv.conv_content.weight.data.zero_()
+                    conv.conv_content.weight.data[:, :, -1] = 1.0
+
+    def reset_parameters(self) -> None:
+        for emb in self.ngram_embeddings:
+            emb.reset_parameters()
+
+    def reset_buffers(self, *, device: Optional[torch.device] = None) -> None:
+        target_device = device or get_default_device()
+        lookup = _build_compressed_lookup_table(
+            tokenizer_id=self._tokenizer_id,
+            vocab_size=self._vocab_size,
+            cache_path=self._cache_path,
+            use_compressed_lookup=self._use_compressed_lookup,
+        ).to(device=target_device, dtype=torch.long)
+        existing = getattr(self, "lookup_table", None)
+        if existing is None or "lookup_table" not in self._buffers:
+            self.register_buffer("lookup_table", lookup, persistent=False)
+        elif existing.is_meta or existing.shape != lookup.shape:
+            setattr(self, "lookup_table", lookup)
+        elif existing.device != lookup.device or existing.dtype != lookup.dtype:
+            setattr(self, "lookup_table", lookup)
+        else:
+            existing.copy_(lookup)
+        for hasher in self.ngram_hashers:
+            hasher.reset_hash_buffers(device=target_device)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        compressed_ids = _map_ids_with_lookup(input_ids, self.lookup_table)
+
+        parts: List[torch.Tensor] = []
+        for hasher, emb in zip(self.ngram_hashers, self.ngram_embeddings):
+            ngram_hash_ids = hasher(compressed_ids)
+            parts.append(emb(ngram_hash_ids).flatten(start_dim=2))
+
+        embeddings = torch.cat(parts, dim=-1) if len(parts) > 1 else parts[0]
+
+        if self.short_convs is not None and len(self.short_convs) > 0:
+            sc_params = ShortConvParams(rmsnorm_eps=self.shortconv_rmsnorm_eps)
+            sc_total = torch.zeros_like(embeddings)
+            for conv in self.short_convs:
+                sc_total = sc_total + compute_shortconv_delta(
+                    src=embeddings,
+                    conv=conv,
+                    params=sc_params,
+                    already_normalized=False,
+                )
+            embeddings = embeddings + sc_total
+
+        return self.value_proj(embeddings)
+
+
 def _warmup_scale_to_python_float(warmup_scale: Union[float, torch.Tensor]) -> float:
     if torch.is_tensor(warmup_scale):
         return float(warmup_scale.detach().float().cpu().item())
@@ -519,6 +702,9 @@ def build_engram_modules(
         )
 
     transformer._engram_enabled = True
+
+    use_compressed_lookup = bool(getattr(embedding_injection, "engram_use_compressed_lookup", True))
+    legacy_h_path = bool(getattr(embedding_injection, "engram_legacy_h_path", False))
 
     engram_mode = getattr(embedding_injection, "engram_mode", "2gram+3gram")
     engram_mode_parts = {s.strip() for s in engram_mode.split("+") if s.strip()}
@@ -549,6 +735,8 @@ def build_engram_modules(
         "ngram_target_capacity": getattr(embedding_injection, "engram_ngram_target_buckets", 75968),
         "ngram_dim": engram_dim_per_ngram,
         "ngram_seed": int(getattr(embedding_injection, "engram_ngram_seed", 137)),
+        "use_compressed_lookup": use_compressed_lookup,
+        "legacy_h_path": legacy_h_path,
     }
 
     h_injection_layers = resolve_configured_layers(
@@ -570,6 +758,8 @@ def build_engram_modules(
         block_key = str(layer_idx)
         if block_key not in transformer._injection_h_embeddings:
             transformer._injection_h_embeddings[block_key] = torch.nn.ModuleList()
+            if not legacy_h_path:
+                transformer._injection_h_gates[block_key] = torch.nn.ParameterList()
         elif len(transformer._injection_h_embeddings[block_key]) > 0:
             raise OLMoConfigurationError(
                 f"Engram supports at most one module per layer; layer {layer_idx} is already initialized"
@@ -595,13 +785,148 @@ def build_engram_modules(
             ngram_base_seed=instance_seed,
             ngram_pad_id=2,
             seen_primes=seen_primes,
+            use_compressed_lookup=ecfg.get("use_compressed_lookup", True),
         )
         transformer._injection_h_embeddings[block_key].append(engram_module)
+
+        if legacy_h_path:
+            continue
+
+        gate_value = float(getattr(transformer, "_injection_lambda_init", 1.0))
+        gate_param = torch.nn.Parameter(torch.empty(1, dtype=torch.float32, device=init_device))
+        if not gate_param.is_meta:
+            gate_param.data.fill_(gate_value)
+        transformer._injection_h_gate_defaults.setdefault(block_key, []).append(gate_value)
+        transformer._injection_h_gates[block_key].append(gate_param)
+        transformer._register_injection_depth_scale(
+            block_key=block_key,
+            gate_idx=len(transformer._injection_h_gates[block_key]) - 1,
+            layer_idx=layer_idx,
+            device=init_device,
+            dtype=torch.float32,
+        )
+
+
+def build_engram_v_modules(
+    transformer: Any,
+    embedding_injection: Any,
+    *,
+    vocab_size: int,
+    d_model: int,
+    dtype: torch.dtype,
+    init_device: str,
+) -> None:
+    """Build Engram n-gram injection modules for attention value paths."""
+    tokenizer_id = getattr(embedding_injection, "engram_tokenizer_id", None)
+    if not tokenizer_id:
+        raise OLMoConfigurationError(
+            "Engram mode requires engram_tokenizer_id in TransformerEmbeddingInjectionConfig"
+        )
+
+    engram_mode = getattr(embedding_injection, "engram_mode", "2gram")
+    engram_mode_parts = {s.strip() for s in engram_mode.split("+") if s.strip()}
+    engram_ngram_levels: List[int] = sorted(int(p.replace("gram", "")) for p in engram_mode_parts)
+    if len(engram_ngram_levels) == 0:
+        raise OLMoConfigurationError("Engram mode requires at least one n-gram level")
+    if any(level < 2 for level in engram_ngram_levels):
+        raise OLMoConfigurationError("Engram mode only supports n-gram levels >= 2")
+
+    num_active_ngrams = len(engram_ngram_levels)
+    engram_dim_per_ngram_cfg = getattr(embedding_injection, "engram_dim_per_ngram", None)
+    engram_dim_per_ngram = (
+        int(engram_dim_per_ngram_cfg)
+        if engram_dim_per_ngram_cfg is not None
+        else d_model // num_active_ngrams
+    )
+
+    use_compressed_lookup = bool(getattr(embedding_injection, "engram_use_compressed_lookup", True))
+    cache_path = getattr(embedding_injection, "engram_cache_path", None) if use_compressed_lookup else None
+
+    shortconv_enabled = bool(getattr(embedding_injection, "engram_shortconv_enabled", True))
+    shortconv_kernels = getattr(embedding_injection, "engram_shortconv_kernels", None)
+    if shortconv_enabled and (not shortconv_kernels or len(shortconv_kernels) == 0):
+        shortconv_kernels = [4]
+
+    ngram_heads = int(getattr(embedding_injection, "engram_ngram_heads", 4))
+    ngram_target_capacity = int(getattr(embedding_injection, "engram_ngram_target_buckets", 75968))
+    ngram_seed = int(getattr(embedding_injection, "engram_ngram_seed", 137))
+    base_seed = int(getattr(embedding_injection, "engram_base_seed", 42))
+
+    v_injection_layers = resolve_configured_layers(
+        getattr(embedding_injection, "v_layers", None),
+        default_layers=list(embedding_injection.layers),
+    )
+
+    def resolve_attention_injection_dim(attention_cfg: Any) -> int:
+        n_heads_cfg = getattr(attention_cfg, "n_heads", None) or 0
+        n_kv_heads_cfg = getattr(attention_cfg, "n_kv_heads", None)
+        n_heads = n_heads_cfg
+        if n_heads <= 0:
+            raise OLMoConfigurationError("Attention injection requires a valid attention.n_heads")
+        n_kv_heads = n_kv_heads_cfg or n_heads
+        if n_kv_heads <= 0:
+            raise OLMoConfigurationError("Attention injection requires a valid attention.n_kv_heads")
+        if n_heads % n_kv_heads != 0:
+            raise OLMoConfigurationError(
+                f"NUM_ATTN_HEADS ({n_heads}) must be divisible by n_kv_heads ({n_kv_heads})"
+            )
+        if d_model % n_heads != 0:
+            raise OLMoConfigurationError(
+                f"d_model ({d_model}) must be divisible by NUM_ATTN_HEADS ({n_heads})"
+            )
+        head_dim = d_model // n_heads
+        return n_kv_heads * head_dim
+
+    seen_primes: Set[int] = set()
+    for module_index, layer_idx in enumerate(v_injection_layers):
+        block_key = str(layer_idx)
+        if block_key not in transformer._injection_v_embeddings:
+            transformer._injection_v_embeddings[block_key] = nn.ModuleList()
+            transformer._injection_v_gates[block_key] = nn.ParameterList()
+
+        embedding_dim = resolve_attention_injection_dim(transformer.blocks[block_key].attention)
+        instance_seed = base_seed + 10007 * layer_idx + module_index * 997
+
+        engram_emb = EngramInjectionEmbedding(
+            d_model=d_model,
+            target_dim=embedding_dim,
+            vocab_size=vocab_size,
+            tokenizer_id=tokenizer_id,
+            cache_path=cache_path,
+            init_device=init_device,
+            dtype=dtype,
+            ngram_levels=engram_ngram_levels,
+            ngram_dim_per_level=engram_dim_per_ngram,
+            ngram_heads_per_level=ngram_heads,
+            ngram_target_capacity=ngram_target_capacity,
+            ngram_base_seed=instance_seed,
+            ngram_pad_id=2,
+            seen_primes=seen_primes,
+            shortconv_enabled=shortconv_enabled,
+            shortconv_kernels=shortconv_kernels,
+            use_compressed_lookup=use_compressed_lookup,
+        )
+        transformer._injection_v_embeddings[block_key].append(engram_emb)
+
+        gate_param = nn.Parameter(torch.empty(1, dtype=torch.float32, device=init_device))
+        if not gate_param.is_meta:
+            gate_param.data.fill_(float(getattr(transformer, "_injection_lambda_init", 1.0)))
+        transformer._injection_v_gates[block_key].append(gate_param)
+        gate_idx = len(transformer._injection_v_gates[block_key]) - 1
+        transformer._register_injection_depth_scale(
+            block_key=f"v_{block_key}",
+            gate_idx=gate_idx,
+            layer_idx=layer_idx,
+            device=init_device,
+            dtype=torch.float32,
+        )
 
 
 def apply_engram_pre_block(
     transformer: Any,
     context: InjectionBlockContext,
+    *,
+    warmup_scale_tensor: torch.Tensor,
 ) -> torch.Tensor:
     if (
         context.block_key not in transformer._injection_h_embeddings
@@ -623,6 +948,41 @@ def apply_engram_pre_block(
         return_gate_mean=False,
     )
     engram_delta = engram_delta.to(dtype=h.dtype, device=h.device)
+    if getattr(transformer, "_engram_legacy_h_path", False):
+        if isinstance(h, DTensor):
+            engram_delta = distribute_like(engram_delta, h)
+        return h + engram_delta
+
+    gates = transformer._injection_h_gates[context.block_key]
+    if len(gates) != 1:
+        raise OLMoConfigurationError(
+            f"Engram expects exactly one H-path gate per layer; "
+            f"found {len(gates)} for layer {context.block_idx}"
+        )
+    lambda_raw = gates[0].to(dtype=h.dtype, device=h.device).view(1, 1, 1)
+    depth_scale = None
+    if not getattr(transformer, "_injection_depth_scale_disabled", False):
+        depth_scale = transformer._get_injection_depth_scale(
+            block_key=context.block_key,
+            gate_idx=0,
+            device=h.device,
+            dtype=h.dtype,
+        )
+    if depth_scale is None:
+        depth_scale = torch.tensor(1.0, dtype=h.dtype, device=h.device)
+    warmup_scale = warmup_scale_tensor.to(dtype=h.dtype, device=h.device)
+    gate = lambda_raw * depth_scale.view(1, 1, 1) * warmup_scale
+    engram_delta = gate * engram_delta
     if isinstance(h, DTensor):
         engram_delta = distribute_like(engram_delta, h)
+    transformer._log_injection_metrics(
+        h_prev=h,
+        injection_delta=engram_delta,
+        gate=gate,
+        lambda_raw=lambda_raw,
+        input_embedding=context.input_embedding,
+        layer_idx=context.block_idx,
+        step=context.step,
+        warmup_scale=warmup_scale,
+    )
     return h + engram_delta

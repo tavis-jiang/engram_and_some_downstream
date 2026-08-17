@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 import signal
 import time
 import uuid
@@ -618,12 +619,30 @@ class Trainer:
             and self.load_strategy != LoadStrategy.never
         ):
             # Try loading from the save folder first.
-            self.maybe_load_checkpoint(self.save_folder)
+            eval_model_only = os.environ.get("OLMO_EVAL_LOAD_MODEL_ONLY", "").lower() in {
+                "1",
+                "true",
+                "yes",
+            }
+            load_trainer_state = False if eval_model_only else None
+            load_optim_state = False if eval_model_only else None
+            if eval_model_only:
+                log.info("OLMO_EVAL_LOAD_MODEL_ONLY=1: loading checkpoint model weights only")
+
+            self.maybe_load_checkpoint(
+                self.save_folder,
+                load_trainer_state=load_trainer_state,
+                load_optim_state=load_optim_state,
+            )
 
             # Then fallback to the load path, if provided.
             if self.load_path is not None:
                 if not self.checkpoint_loaded:
-                    self.maybe_load_checkpoint(self.load_path)
+                    self.maybe_load_checkpoint(
+                        self.load_path,
+                        load_trainer_state=load_trainer_state,
+                        load_optim_state=load_optim_state,
+                    )
                 else:
                     log.warning(
                         f"Ignoring load path ('{self.load_path}') since checkpoint was found in save folder"

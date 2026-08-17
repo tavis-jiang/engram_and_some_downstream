@@ -1,0 +1,27 @@
+{
+  "model": "xgram",
+  "task": "triviaqa_em",
+  "run_label": "full_sharded_20260605",
+  "num_examples": 7993,
+  "correct": 1,
+  "exact_match": 0.00012510947078693858,
+  "records": "reports/generation_em_xgram_triviaqa_em_full_sharded_20260605_20260605-154835.jsonl",
+  "source_files": [
+    "reports/generation_em_xgram_triviaqa_em_shard0-of-16_20260605-135809.jsonl",
+    "reports/generation_em_xgram_triviaqa_em_shard1-of-16_20260605-135740.jsonl",
+    "reports/generation_em_xgram_triviaqa_em_shard10-of-16_20260605-142707.jsonl",
+    "reports/generation_em_xgram_triviaqa_em_shard11-of-16_20260605-142859.jsonl",
+    "reports/generation_em_xgram_triviaqa_em_shard12-of-16_20260605-144208.jsonl",
+    "reports/generation_em_xgram_triviaqa_em_shard13-of-16_20260605-144143.jsonl",
+    "reports/generation_em_xgram_triviaqa_em_shard14-of-16_20260605-144010.jsonl",
+    "reports/generation_em_xgram_triviaqa_em_shard15-of-16_20260605-144401.jsonl",
+    "reports/generation_em_xgram_triviaqa_em_shard2-of-16_20260605-135822.jsonl",
+    "reports/generation_em_xgram_triviaqa_em_shard3-of-16_20260605-135817.jsonl",
+    "reports/generation_em_xgram_triviaqa_em_shard4-of-16_20260605-141229.jsonl",
+    "reports/generation_em_xgram_triviaqa_em_shard5-of-16_20260605-141310.jsonl",
+    "reports/generation_em_xgram_triviaqa_em_shard6-of-16_20260605-141426.jsonl",
+    "reports/generation_em_xgram_triviaqa_em_shard7-of-16_20260605-141229.jsonl",
+    "reports/generation_em_xgram_triviaqa_em_shard8-of-16_20260605-142654.jsonl",
+    "reports/generation_em_xgram_triviaqa_em_shard9-of-16_20260605-142630.jsonl"
+  ]
+}

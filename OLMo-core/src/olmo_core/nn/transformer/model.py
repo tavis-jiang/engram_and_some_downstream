@@ -47,9 +47,11 @@ from ..attention import (
 )
 from ..buffer_cache import BufferCache
 from ..embedding_injection.engram import (
+    EngramInjectionEmbedding,
     EngramModule,
     apply_engram_pre_block,
     build_engram_modules,
+    build_engram_v_modules,
 )
 from ..embedding_injection.ops.hash_injection import HashTokenMapInjection
 from ..embedding_injection.metrics import (
@@ -59,7 +61,7 @@ from ..embedding_injection.mort import build_mort_modules, init_mort_modules, pr
 from ..embedding_injection.ops.shortconv import SwiGLUShortConv
 from ..embedding_injection.retoken import build_retoken_modules, init_retoken_modules, prepare_retoken_block_kwargs
 from ..embedding_injection.runtime import InjectionBlockContext
-from ..embedding_injection.xgram import build_xgram_modules, prepare_xgram_block_kwargs
+from ..embedding_injection.xgram import build_comembed_modules, build_xgram_modules, prepare_xgram_block_kwargs
 from ..functional import l2_normalize
 from ..lm_head import LMHeadConfig, LMOutputWithLoss
 from ..moe import MoEBase
@@ -108,6 +110,8 @@ def _embedding_like_numel(module: Optional[nn.Module]) -> int:
         return total
     if isinstance(module, EngramModule):
         return sum(int(emb.weight.numel()) for emb in module.ngram_embeddings)
+    if hasattr(module, "reset_comembed_parameters"):
+        return sum(int(param.numel()) for param in module.parameters())
     return 0
 
 
@@ -147,7 +151,7 @@ def _resolve_injection_target_state(
     injection_version: str,
     injection_targets_raw: Optional[str],
 ) -> Tuple[List[str], List[str], bool]:
-    if injection_version == "X-gram":
+    if injection_version in {"X-gram", "ComEmbed"}:
         injection_targets = _parse_ordered_injection_targets(
             injection_targets_raw,
             valid=_XGRAM_TARGET_SET,
@@ -239,6 +243,7 @@ class Transformer(nn.Module):
         self._retoken_scalers = nn.ModuleDict()
         self._injection_h_shortconvs = nn.ModuleDict()
         self._engram_enabled = False
+        self._engram_legacy_h_path = False
         self._engram_config: Optional[Dict[str, Any]] = None
         self._mort_aux_loss_weight = mort_aux_loss_weight
         self._injection_qk_embeddings = nn.ModuleDict()
@@ -358,7 +363,7 @@ class Transformer(nn.Module):
             else 0,
         )
         if (
-            injection_version == "X-gram"
+            injection_version in {"X-gram", "ComEmbed", "Engram"}
             and self._injection_lambda_warmup_enabled
             and self._injection_lambda_warmup_steps == 0
         ):
@@ -369,6 +374,11 @@ class Transformer(nn.Module):
 
         # Engram: parse configuration from TransformerEmbeddingInjectionConfig.
         self._engram_enabled = injection_version == "Engram"
+        self._engram_legacy_h_path = bool(
+            getattr(embedding_injection, "engram_legacy_h_path", False)
+            if embedding_injection is not None
+            else False
+        )
         if self._engram_enabled:
             _engram_tokenizer_id = (
                 getattr(embedding_injection, "engram_tokenizer_id", None)
@@ -435,11 +445,12 @@ class Transformer(nn.Module):
                 "ngram_target_capacity": _engram_ngram_target,
                 "ngram_dim": _engram_dim_per_ngram,
                 "ngram_seed": _engram_ngram_seed,
+                "legacy_h_path": self._engram_legacy_h_path,
             }
             log.info(
                 "Engram config prepared (mode=%s dim_per_ngram=%d hc_mult=%d "
                 "shortconv=%s kernel=%d tokenizer=%s "
-                "ngram_levels=%s ngram_heads=%d ngram_target=%s)",
+                "ngram_levels=%s ngram_heads=%d ngram_target=%s legacy_h_path=%s)",
                 _engram_mode,
                 _engram_dim_per_ngram,
                 _engram_hc_mult,
@@ -449,12 +460,31 @@ class Transformer(nn.Module):
                 _engram_ngram_levels,
                 _engram_ngram_heads,
                 _engram_ngram_target,
+                self._engram_legacy_h_path,
             )
 
-        self._injection_targets, self._attention_injection_targets, self._h_target_enabled = _resolve_injection_target_state(
-            injection_version=injection_version,
-            injection_targets_raw=injection_targets_raw,
-        )
+        if self._engram_enabled and embedding_injection is not None:
+            # Engram can target h/q/k/v/o like X-gram. Default to h for backward compatibility.
+            _engram_targets_raw = (
+                getattr(embedding_injection, "engram_targets", None)
+                or getattr(embedding_injection, "targets", None)
+                or ["h"]
+            )
+            _engram_targets = []
+            for t in _engram_targets_raw:
+                t = str(t).strip().lower()
+                if t in {"h", "q", "k", "v", "o"} and t not in _engram_targets:
+                    _engram_targets.append(t)
+            if not _engram_targets:
+                _engram_targets = ["h"]
+            self._injection_targets = _engram_targets
+            self._attention_injection_targets = [t for t in _engram_targets if t in {"q", "k", "v", "o"}]
+            self._h_target_enabled = "h" in _engram_targets
+        else:
+            self._injection_targets, self._attention_injection_targets, self._h_target_enabled = _resolve_injection_target_state(
+                injection_version=injection_version,
+                injection_targets_raw=injection_targets_raw,
+            )
         attention_has_qkv = any(t in {"q", "k", "v"} for t in self._attention_injection_targets)
         attention_qkv_targets = [t for t in self._attention_injection_targets if t in {"q", "k", "v"}]
         attention_qkv_target_set = set(attention_qkv_targets)
@@ -494,15 +524,43 @@ class Transformer(nn.Module):
                     hash_num_heads=default_hash_num_heads,
                     hash_multipliers=default_hash_head_multipliers_k2,
                 )
-            elif injection_version == "Engram":
-                build_engram_modules(
+            elif injection_version == "ComEmbed":
+                build_comembed_modules(
                     self,
                     embedding_injection,
                     vocab_size=vocab_size,
                     d_model=d_model,
+                    n_layers=n_layers,
                     dtype=dtype,
                     init_device=init_device,
+                    init_std=self.init_std,
+                    hash_num_heads=default_hash_num_heads,
+                    hash_multipliers=default_hash_head_multipliers_k2,
                 )
+            elif injection_version == "Engram":
+                if self._h_target_enabled:
+                    build_engram_modules(
+                        self,
+                        embedding_injection,
+                        vocab_size=vocab_size,
+                        d_model=d_model,
+                        dtype=dtype,
+                        init_device=init_device,
+                    )
+                if any(t in {"q", "k", "v", "o"} for t in self._attention_injection_targets):
+                    unsupported = set(self._attention_injection_targets) - {"v"}
+                    if unsupported:
+                        raise OLMoConfigurationError(
+                            f"Engram attention injection currently only supports 'v'; got {unsupported}"
+                        )
+                    build_engram_v_modules(
+                        self,
+                        embedding_injection,
+                        vocab_size=vocab_size,
+                        d_model=d_model,
+                        dtype=dtype,
+                        init_device=init_device,
+                    )
             elif injection_version == "Retoken":
                 build_retoken_modules(
                     self,
@@ -878,6 +936,19 @@ class Transformer(nn.Module):
                 for module in modules:
                     if isinstance(module, EngramModule):
                         module.reset_buffers(device=device)
+            for emb_dict in (
+                self._injection_v_embeddings,
+                self._injection_q_embeddings,
+                self._injection_k_embeddings,
+                self._injection_o_embeddings,
+                self._injection_qk_embeddings,
+            ):
+                if emb_dict is None:
+                    continue
+                for modules in emb_dict.values():
+                    for module in modules:
+                        if hasattr(module, "reset_buffers"):
+                            module.reset_buffers(device=device)
 
         for module in self.modules():
             if hasattr(module, "reset_parameters"):
@@ -951,6 +1022,8 @@ class Transformer(nn.Module):
                                 if not local_w.is_meta:
                                     local_w.zero_()
                                     local_w[:, :, -1] = 1.0
+                        if hasattr(embedding, "reset_comembed_parameters"):
+                            embedding.reset_comembed_parameters()
         if self._embedding_injection_config is not None:
             injection_version = self._injection_version
             for block_key, gates in self._injection_h_gates.items():
@@ -1516,11 +1589,24 @@ class Transformer(nn.Module):
                 retoken_result = prepare_retoken_block_kwargs(self, context)
                 block_kwargs.update(retoken_result.block_kwargs)
             elif injection_version == "Engram":
-                h = apply_engram_pre_block(self, context)
+                if self._attention_injection_targets:
+                    xgram_result = prepare_xgram_block_kwargs(
+                        self,
+                        context,
+                        warmup_scale_tensor=warmup_scale_tensor,
+                    )
+                    h = xgram_result.hidden_states
+                    block_kwargs.update(xgram_result.block_kwargs)
+                elif self._h_target_enabled:
+                    h = apply_engram_pre_block(
+                        self,
+                        context,
+                        warmup_scale_tensor=warmup_scale_tensor,
+                    )
             elif injection_version == "Mort":
                 mort_result = prepare_mort_block_kwargs(self, context)
                 block_kwargs.update(mort_result.block_kwargs)
-            elif injection_version == "X-gram":
+            elif injection_version in {"X-gram", "ComEmbed"}:
                 xgram_result = prepare_xgram_block_kwargs(
                     self,
                     context,
